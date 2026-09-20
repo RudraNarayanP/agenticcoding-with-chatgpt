@@ -13,11 +13,12 @@ mod cmd; // subcommand entry points (ask / run / serve / mcp / handoff)
 mod delegation; // structured delegation packets (the planner/reviewer main line)
 mod ledger; // append-only audit trail at ~/.chatgpt-use/ledger.jsonl
 mod oauth; // OAuth 2.1 + PKCE provider for the MCP server
-mod receipt; // ask --request-id: durable per-request receipts
+mod openrouter;
 mod protocol; // tool-call text protocol: types, system prompt, parsing, rendering
+mod receipt; // ask --request-id: durable per-request receipts
 mod structured; // ask --output-schema: validate a reply against a caller's JSON Schema
 mod tools; // local tool executor (read_file / write_file / bash / grep / list_dir)
-mod util; // cross-platform home dir + random bytes
+mod util; // cross-platform home dir + random bytes // cheap OpenRouter models as the executor half of the plan/act split
 
 use clap::Parser;
 use cli::{Cli, Command};
@@ -30,6 +31,7 @@ fn main() {
         Command::Serve(args) => cmd::serve::run(args),
         Command::Mcp(args) => cmd::mcp::run(args),
         Command::Handoff(args) => cmd::handoff::run(args),
+        Command::Delegate(args) => cmd::delegate::run(args),
         Command::Init(args) => cmd::init::run(args),
         Command::Work(args) => cmd::work::run(args),
         Command::Refresh(args) => cmd::refresh::run(args),

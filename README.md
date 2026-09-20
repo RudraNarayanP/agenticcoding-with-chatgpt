@@ -38,10 +38,11 @@ from your coding agent, this closes the gap: route the cheap-and-already-paid wo
 
 ---
 
-## Three modes
+## Four ways in, cheapest first
 
 `chatgpt-use` is one engine — a `chrome-use`-driven **channel** to the ChatGPT web conversation (send a
-message, wait for the reply, parse it) — exposed three ways depending on **who's the brain**.
+message, wait for the reply, parse it) — exposed three ways depending on **who's the brain**, plus a
+fourth that deliberately splits the role in two: ChatGPT plans, a cheap model executes.
 
 ### Mode 1 · 副手 / Sidekick — `chatgpt-use ask`
 
@@ -157,6 +158,49 @@ chatgpt-use run "Add a --json flag to the status command and update the tests"
 **This is why goal "let ChatGPT read my files" needs no tunnel and no exposed file server.** File
 access *is* the `read_file` / `grep` tools: the local harness reads the bytes and hands them into the
 conversation. ChatGPT never reaches back to your machine — it just asks, and the hands obey.
+
+### Two-tier · 分层 / Delegate — `chatgpt-use delegate`
+
+**ChatGPT decides; a free model types.** Mode 2 makes ChatGPT do both, and the doing is the part
+that costs: emitting a 300-line file one token at a time is the most quota-hungry shape of work, and
+it needs no judgement at all. So split it:
+
+```bash
+chatgpt-use delegate "add a --json flag to status and update the tests" --file src/cmd/status.rs
+```
+
+1. **Plan** — ChatGPT (Pro, if you pass `--model pro`) returns a structured `DelegationPacket`:
+   `goal`, ordered `plan[]` steps each with `target` + `success_criteria`, `acceptance`, `do_not_do`.
+2. **Execute in chunks** — `--chunk-steps` (default 3) steps per executor session. Each chunk is a
+   **fresh OpenRouter context** seeded with the goal, the acceptance criteria, the prohibitions, a
+   one-line summary of what earlier chunks achieved, and only its own steps. The executor calls
+   `read_file` / `write_file` / `bash` / `grep` / `list_dir` — the same local tools Mode 2 uses —
+   until it returns a `DONE:` line with evidence.
+3. **Check in** — after each chunk, a compact report goes back into the *same* ChatGPT conversation
+   and the planner answers one word: `CONTINUE` or `STOP`. A bad chunk gets caught at chunk 2, not
+   discovered at the end. `--no-review` skips this.
+4. **Review** — a final report goes to the planner for a `PROCEED`/`REVISE` verdict against the
+   acceptance criteria.
+
+Why it's shaped around chunks: a free model's context is where this design degrades, and re-seeding
+per chunk is what lets a fifty-tool-call task finish instead of rotting. The planner never sees tool
+chatter — only one-line outcomes — which is also what keeps each check-in to a single cheap turn
+rather than a ~45-request page load.
+
+```bash
+--exec-model <id>     default: resolved live from OpenRouter's catalogue, free-tier only
+--chunk-steps N       plan steps per executor session (default 3)
+--executor-turns N    tool-call turns per chunk before it is reported unfinished (default 25)
+--dry-run             plan and show the chunking; no executor calls, no edits
+--permission-mode …   safe|trusted|dangerous, gating the executor's bash (default trusted)
+```
+
+Needs an OpenRouter key — free-tier models still require one: `export OPENROUTER_API_KEY=sk-or-…`
+or write it to `~/.chatgpt-use/openrouter.key`. The key is checked **before** the browser opens, so a
+missing one costs no ChatGPT requests. `curl` does the HTTP; this adds no HTTP client dependency, for
+the same reason `jsonschema` has its default features off.
+
+---
 
 ### Mode 3 · 替身 / Drop-in model — `chatgpt-use serve`
 

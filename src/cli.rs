@@ -27,6 +27,10 @@ pub enum Command {
     Mcp(McpArgs),
     /// Executor handoff — feed a delegation packet to Codex / Claude Code to run.
     Handoff(HandoffArgs),
+    /// Two-tier delegation — ChatGPT plans and reviews, a free OpenRouter model
+    /// executes the plan in bounded chunks. The thinking is bought with the
+    /// subscription; the typing costs nothing.
+    Delegate(DelegateArgs),
     /// One-time setup — generate an auth token at ~/.chatgpt-use/auth.json and
     /// print the next steps (the `mcp` command auto-loads it when --token is omitted).
     Init(InitArgs),
@@ -200,6 +204,46 @@ pub struct RunArgs {
     pub max_steps: u32,
     /// Command-gating level for `bash` (safe|trusted|dangerous). Local Mode-2
     /// defaults to trusted.
+    #[arg(long, value_enum, default_value_t = PermissionMode::Trusted)]
+    pub permission_mode: PermissionMode,
+    #[command(flatten)]
+    pub channel: ChannelArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct DelegateArgs {
+    /// The task. ChatGPT turns it into a structured plan; the executor carries
+    /// it out chunk by chunk.
+    pub task: String,
+    /// Files whose contents seed the planning prompt (repeatable).
+    #[arg(long = "file")]
+    pub files: Vec<String>,
+    /// Working directory the executor's tools operate in (default: current dir).
+    #[arg(long)]
+    pub cwd: Option<String>,
+    /// Plan steps per executor session. Each chunk gets a fresh OpenRouter
+    /// context, so this is the knob that bounds context rot on a long task.
+    #[arg(long, default_value_t = 3)]
+    pub chunk_steps: usize,
+    /// Tool-call turns allowed inside one chunk before it is reported as
+    /// unfinished rather than silently truncated.
+    #[arg(long, default_value_t = 25)]
+    pub executor_turns: u32,
+    /// OpenRouter model for the executor. Default: a free-tier model.
+    #[arg(long)]
+    pub exec_model: Option<String>,
+    /// Wall-clock budget for one executor completion, in seconds. Free tiers
+    /// queue, so this is separate from the planner's --timeout.
+    #[arg(long, default_value_t = 180)]
+    pub exec_timeout: u64,
+    /// Skip the check-in with ChatGPT after each chunk. Saves requests on the
+    /// account, and gives up the planner's chance to redirect a bad chunk.
+    #[arg(long)]
+    pub no_review: bool,
+    /// Print the plan and its chunking, and stop. No executor call, no edits.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Command-gating level for the executor's `bash` (safe|trusted|dangerous).
     #[arg(long, value_enum, default_value_t = PermissionMode::Trusted)]
     pub permission_mode: PermissionMode,
     #[command(flatten)]
