@@ -425,8 +425,8 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
   relay *before* any profile was chosen, which is fatal because chrome-use binds a session's daemon
   to whichever command starts it and ignores `--profile` after that. So the probe reported success,
   `connect` declared the relay usable, and the run died later at the composer with "the message was
-  never submitted". Verified offline too: 132/132 tests on Windows under *both* bash-tool shell
-  paths, 130/130 on Linux, and `init`/`status`/`cancel` each exercised against a live local process.
+  never submitted". Verified offline too: 134/134 tests on Windows under *both* bash-tool shell
+  paths, 132/132 on Linux, and `init`/`status`/`cancel` each exercised against a live local process.
   Mode 2 (`run`) is verified on Windows as well: a task drove a two-step loop, called `write_file`,
   `list_dir` and `bash`, and produced a working single-file calculator whose extracted logic passed
   10/10 arithmetic assertions. Not verified on Windows: `work` (needs a tunnel + connector) and
