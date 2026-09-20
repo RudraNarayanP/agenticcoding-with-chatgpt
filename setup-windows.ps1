@@ -42,12 +42,20 @@ function Add-BinDirToPath {
 # `rustc --version` errored, so the old check reported "Rust is required" while
 # Rust was half there, or the reverse, depending on the failure.
 function Test-Rust {
-    $probe = & rustc --version 2>&1
-    if ($LASTEXITCODE -ne 0 -or -not $probe) { return $null }
-    # "cargo 1.98.1" - cargo can be missing while rustc works.
-    $cargoProbe = & cargo --version 2>&1
-    if ($LASTEXITCODE -ne 0 -or -not $cargoProbe) { return $null }
-    return "$probe / $cargoProbe"
+    try {
+        $probe = & rustc --version 2>&1
+        if ($LASTEXITCODE -ne 0 -or -not $probe) { return $null }
+        # "cargo 1.98.1" - cargo can be missing while rustc works.
+        $cargoProbe = & cargo --version 2>&1
+        if ($LASTEXITCODE -ne 0 -or -not $cargoProbe) { return $null }
+        return "$probe / $cargoProbe"
+    } catch {
+        # With ErrorActionPreference=Stop, a command absent from PATH is a
+        # terminating CommandNotFoundException, so the checks above never run.
+        # That is the ordinary first-run case on a machine with no Rust, and it
+        # has to reach the friendly message below rather than dump this stack.
+        return $null
+    }
 }
 
 function Get-LatestChromeUseTag {
@@ -106,13 +114,21 @@ function Install-ChromeUse([string]$Tag) {
 
 function Build-ChatGptUse {
     Write-Step 'building chatgpt-use (release)'
-    # Note: `cargo build` writes target\ under the repo. On machines with Smart
-    # App Control or a WDAC policy, executables produced under some user-writable
-    # locations (Desktop included) are blocked from running; CARGO_TARGET_DIR can
-    # point somewhere the policy allows.
     & cargo build --release
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
-    Copy-Item -Force '.\target\release\chatgpt-use.exe' (Join-Path $BinDir 'chatgpt-use.exe')
+    # Resolve where cargo actually put it instead of assuming .\target\release.
+    # AGENTS.md tells people on this machine to set CARGO_TARGET_DIR outside
+    # Desktop, because binaries built under Desktop are blocked from running - so
+    # the hardcoded path broke precisely for the users the doc steers here.
+    $candidates = @()
+    if ($env:CARGO_TARGET_DIR) { $candidates += Join-Path $env:CARGO_TARGET_DIR 'release\chatgpt-use.exe' }
+    $candidates += Join-Path (Get-Location).Path 'target\release\chatgpt-use.exe'
+    $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $exe) {
+        throw "chatgpt-use.exe not found after a successful build. Looked in:`n  " + ($candidates -join "`n  ")
+    }
+    Copy-Item -Force $exe (Join-Path $BinDir 'chatgpt-use.exe')
+    Write-Ok "from $exe"
     Write-Ok "installed $(Join-Path $BinDir 'chatgpt-use.exe')"
 }
 
