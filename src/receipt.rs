@@ -156,13 +156,40 @@ pub fn live_state(r: &Receipt, alive: impl Fn(u32) -> bool) -> String {
 
 /// Whether `pid` is still a chatgpt-use process. Pids are reused, and `cancel`
 /// signals this pid, so a live process that is something else must not count.
+///
+/// Two questions, not one: the old Unix branch asked `ps` for the pid's command
+/// name and required it to contain `chatgpt-use`. The Windows branch has to keep
+/// that second half — `tasklist` filtered by pid answers "is it alive", and the
+/// image name in the same line answers "is it still us". Before this, `ps` simply
+/// failed to spawn on Windows and `unwrap_or(false)` made every live owner look
+/// dead, so `status` reported `submission_unknown` for a running request and
+/// `cancel` refused to touch its owner.
 pub fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("chatgpt-use"))
+    #[cfg(windows)]
+    {
+        // `/FO CSV /NH` gives one quoted line: "image.exe","pid","Session",…
+        // A no-match filter prints a prose "INFO: No tasks…" line and no pid.
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .stderr(std::process::Stdio::null())
+            .output();
+        out.map(|o| {
+            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("chatgpt-use")
+        })
         .unwrap_or(false)
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| {
+                o.status.success() && String::from_utf8_lossy(&o.stdout).contains("chatgpt-use")
+            })
+            .unwrap_or(false)
+    }
 }
 
 fn now() -> u64 {
@@ -170,6 +197,57 @@ fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ---- cooperative cancel -----------------------------------------------------
+//
+// `cancel` used to reach its owner with `kill -TERM`, which is the whole of
+// cross-process cancel on Unix and is not a thing Windows has: there is no
+// signal to send a process attached to a different console, and the blunt
+// alternative (`taskkill`) terminates the owner mid-generation so it never
+// presses stop in its own tab and never records an outcome — the exact
+// "did my prompt go in?" hole the receipt exists to close.
+//
+// So a cancel request is a file. The owner already checks `cancel_requested()`
+// in every wait loop, which is where SIGTERM lands on Unix; checking the marker
+// in the same place gives both platforms the same graceful path, and Windows a
+// cancel at all. Unix keeps SIGTERM as an accelerator for the case where the
+// owner is blocked somewhere that does not poll.
+
+/// The marker that accompanies receipt `path` — `<id>.json.cancel`.
+fn cancel_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.cancel",
+        path.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ))
+}
+
+/// Ask the owner of the request at `path` to stop. Content is diagnostic only;
+/// the owner reacts to the file existing.
+pub fn request_cancel(path: &Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(
+        cancel_path(path),
+        format!(
+            "{{\"requested_by_pid\":{},\"requested_at\":{}}}\n",
+            std::process::id(),
+            now()
+        ),
+    )
+}
+
+/// Whether a cancel has been requested for the request at `path`.
+pub fn cancel_marked(path: &Path) -> bool {
+    cancel_path(path).exists()
+}
+
+/// Forget any cancel request, so a later request reusing the id starts clean.
+pub fn clear_cancel(path: &Path) {
+    let _ = std::fs::remove_file(cancel_path(path));
 }
 
 #[cfg(test)]
@@ -232,5 +310,27 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cancel_marker_is_visible_to_the_owner_and_forgets_cleanly() {
+        // This file is the whole cross-process cancel on Windows, so its
+        // naming and lifetime are worth pinning down.
+        let dir = std::env::temp_dir().join(format!("cgu-cancel-{}", std::process::id()));
+        let path = dir.join("r.json");
+        assert!(!cancel_marked(&path), "nothing is marked before a cancel is asked for");
+
+        request_cancel(&path).unwrap();
+        assert!(cancel_marked(&path), "the owner must see the request");
+        assert!(
+            dir.join("r.json.cancel").exists(),
+            "the marker sits beside the receipt, it never replaces it"
+        );
+        assert!(load(&path).is_none(), "a cancel request must not fake a receipt");
+
+        clear_cancel(&path);
+        assert!(!cancel_marked(&path));
+        clear_cancel(&path); // clearing twice must not be an error
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -527,22 +527,232 @@ fn format_output(stdout: &str, stderr: &str, exit_code: i32, note: Option<&str>)
     result
 }
 
-/// Original stateless behavior: one fresh `sh -c` at `cwd`, no timeout.
+// ---- which shell the `bash` tool drives ------------------------------------
+//
+// The tool is named for a POSIX shell, and its persistent session is written in
+// one. `Command::new("sh")` happened to work on a Windows box with Git for
+// Windows on `PATH`, and on every other Windows box turned into a spawn failure
+// the MCP client could only report as a broken tool. So: use a real POSIX shell
+// when there is one — that keeps the session semantics, and the state files,
+// byte-identical to Unix — and fall back to PowerShell when there is not.
+//
+// The two differ in one deliberate way beyond quoting. POSIX redirects the
+// command's output to files from inside the wrapper, which is what lets us poll
+// for a timeout without a pipe that can fill. PowerShell cannot: its `1>` goes
+// through `Out-File`, which in Windows PowerShell writes UTF-16, and the file
+// then fails to read back as the UTF-8 we hand the model. So the PowerShell
+// path redirects at the process instead, which is raw bytes.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shell {
+    Posix,
+    PowerShell,
+}
+
+struct ShellSpec {
+    program: PathBuf,
+    kind: Shell,
+}
+
+/// Resolved once per process: shell discovery spawns nothing, but it does walk
+/// `PATH`, and the answer must not change mid-session.
+fn shell_spec() -> &'static ShellSpec {
+    static SHELL: OnceLock<ShellSpec> = OnceLock::new();
+    SHELL.get_or_init(ShellSpec::detect)
+}
+
+impl ShellSpec {
+    fn detect() -> Self {
+        #[cfg(unix)]
+        return ShellSpec { program: PathBuf::from("sh"), kind: Shell::Posix };
+
+        #[cfg(windows)]
+        {
+            // An explicit seam: forces the shell regardless of what is installed,
+            // so CI can run the whole suite down both paths on one machine, and
+            // so anyone can work around a detection choice that misbehaves.
+            match std::env::var("CHATGPT_USE_SHELL").ok().as_deref() {
+                Some("powershell") => {
+                    return ShellSpec {
+                        program: PathBuf::from("powershell"),
+                        kind: Shell::PowerShell,
+                    };
+                }
+                Some("posix") => {
+                    return ShellSpec { program: PathBuf::from("sh"), kind: Shell::Posix };
+                }
+                Some(other) if !other.is_empty() => {
+                    return ShellSpec {
+                        program: PathBuf::from(other),
+                        kind: match Path::new(other)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_ascii_lowercase())
+                            .as_deref()
+                        {
+                            Some("pwsh") | Some("powershell") => Shell::PowerShell,
+                            _ => Shell::Posix,
+                        },
+                    };
+                }
+                _ => {}
+            }
+            for name in ["sh", "bash"] {
+                if let Some(p) = crate::util::which(name) {
+                    return ShellSpec { program: p, kind: Shell::Posix };
+                }
+            }
+            // Git for Windows is frequently installed without its `usr\bin`
+            // reaching the PATH of whatever launched us.
+            if let Some(p) = git_shell_path() {
+                return ShellSpec { program: p, kind: Shell::Posix };
+            }
+            for name in ["pwsh", "powershell"] {
+                if let Some(p) = crate::util::which(name) {
+                    return ShellSpec { program: p, kind: Shell::PowerShell };
+                }
+            }
+            // Present on every supported Windows, even with no PowerShell on PATH.
+            ShellSpec {
+                program: PathBuf::from(
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                ),
+                kind: Shell::PowerShell,
+            }
+        }
+    }
+
+    /// argv that runs `script`.
+    fn args<'a>(&'a self, script: &'a str) -> Vec<&'a str> {
+        match self.kind {
+            Shell::Posix => vec!["-c", script],
+            // No profile: a user's `$PROFILE` must not inject state, banners, or
+            // failures into a tool call. Non-interactive: nothing may prompt.
+            Shell::PowerShell => vec!["-NoProfile", "-NonInteractive", "-Command", script],
+        }
+    }
+
+    fn command(&self, script: &str) -> Command {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(self.args(script));
+        cmd
+    }
+}
+
+/// Where Git for Windows keeps a POSIX shell, if it is installed off `PATH`.
+#[cfg(windows)]
+fn git_shell_path() -> Option<PathBuf> {
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        let Some(root) = std::env::var_os(var) else { continue };
+        for sub in ["Git\\bin", "Git\\usr\\bin"] {
+            let dir = PathBuf::from(&root).join(sub);
+            for name in ["sh.exe", "bash.exe"] {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    None
+}
+
+impl Shell {
+    /// File the persistent session keeps exported variables in. The two shells
+    /// write incompatible formats, so they must never share one file.
+    fn env_file(self) -> &'static str {
+        match self {
+            Shell::Posix => "env",
+            Shell::PowerShell => "env.ps1",
+        }
+    }
+
+    /// Single-quote a path for literal use in this shell.
+    fn quote(self, p: &Path) -> String {
+        let s = p.to_string_lossy();
+        match self {
+            // Close the quote, insert an escaped one, reopen.
+            Shell::Posix => format!("'{}'", s.replace('\'', "'\\''")),
+            // In PowerShell single quotes, a quote is doubled.
+            Shell::PowerShell => format!("'{}'", s.replace('\'', "''")),
+        }
+    }
+
+    /// The wrapper that restores the session, runs the command, and saves the
+    /// session back. `command` is injected verbatim — arbitrary shell is the
+    /// feature — so only the fixed paths are quoted.
+    fn wrapper(
+        self,
+        command: &str,
+        default_cwd: &Path,
+        cwd_file: &Path,
+        env_file: &Path,
+        out_file: &Path,
+        err_file: &Path,
+    ) -> String {
+        let (cwd, env, def) =
+            (self.quote(cwd_file), self.quote(env_file), self.quote(default_cwd));
+        match self {
+            // Unchanged from the Unix implementation, byte for byte. `quote`
+            // already yields a complete single-quoted literal, so the template
+            // must not add another pair.
+            Shell::Posix => {
+                let (out, err) = (self.quote(out_file), self.quote(err_file));
+                format!(
+                    "__d=\"$(cat {cwd} 2>/dev/null)\"\n\
+                     if [ -d \"$__d\" ]; then cd \"$__d\"; else cd {def}; fi\n\
+                     [ -f {env} ] && . {env} 2>/dev/null\n\
+                     {{\n{cmd}\n}} > {out} 2> {err}\n\
+                     __rc=$?\n\
+                     pwd > {cwd} 2>/dev/null\n\
+                     export -p > {env} 2>/dev/null\n\
+                     exit $__rc\n",
+                    cmd = command,
+                )
+            }
+            // Two deliberate differences from the POSIX wrapper beyond quoting.
+            // The env dump writes `${env:NAME}`, not `$env:NAME`, because real
+            // environment variable names contain characters that end a bare
+            // reference — `CommonProgramFiles(x86)` is a PowerShell parse error,
+            // and one unrepresentable name would abort the whole restore; names
+            // holding a brace are skipped since neither form can express them.
+            // And output is redirected by the caller at process level, not with
+            // `1>`/`2>` here, because PowerShell redirection goes through
+            // `Out-File`, which in Windows PowerShell writes UTF-16 that would
+            // not read back as the UTF-8 we hand the model.
+            Shell::PowerShell => format!(
+                "$ErrorActionPreference = 'Continue'\n\
+                 $__d = ''\n\
+                 if (Test-Path -LiteralPath {cwd}) {{ $__d = (Get-Content -LiteralPath {cwd} -Raw).Trim() }}\n\
+                 if ($__d -and (Test-Path -LiteralPath $__d -PathType Container)) {{ Set-Location -LiteralPath $__d }} else {{ Set-Location -LiteralPath {def} }}\n\
+                 if (Test-Path -LiteralPath {env}) {{ . {env} }}\n\
+                 & {{\n{cmd}\n}}\n\
+                 $__rc = if ($null -ne $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 0 }}\n\
+                 (Get-Location).Path | Out-File -LiteralPath {cwd} -Encoding ascii\n\
+                 Get-ChildItem Env: | Where-Object {{ $_.Name -notmatch '[{{}}]' }} | ForEach-Object {{ '${{{{env:{{0}}}}}}={{1}}' -f $_.Name, (\"'\" + (\"$($_.Value)\" -replace \"'\", \"''\") + \"'\") }} | Out-File -LiteralPath {env} -Encoding ascii\n\
+                 exit $__rc\n",
+                cmd = command,
+            ),
+        }
+    }
+}
+
+/// Original stateless behavior: one fresh shell at `cwd`, no timeout.
 fn run_oneshot(command: &str, cwd: &Path, perm: PermissionMode) -> Result<String, String> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command).current_dir(cwd);
+    let spec = shell_spec();
+    let mut cmd = spec.command(command);
+    cmd.current_dir(cwd);
     apply_env_filter(&mut cmd, perm);
     let output = cmd
         .output()
-        .map_err(|e| format!("bash: failed to spawn shell: {e}"))?;
+        .map_err(|e| format!("bash: failed to spawn shell ({}): {e}", spec.program.display()))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     Ok(format_output(&stdout, &stderr, output.status.code().unwrap_or(-1), None))
 }
 
 /// Persistent-terminal behavior: the working directory and exported env carry
-/// over between calls, with a per-command timeout. Output is redirected to files
-/// inside the state dir (no pipes → no buffer deadlock while we poll for the
+/// over between calls, with a per-command timeout. Output goes to files inside
+/// the state dir (no pipes → no buffer deadlock while we poll for the
 /// timeout). On timeout the child is killed and partial output is returned.
 fn run_persistent(
     command: &str,
@@ -550,45 +760,38 @@ fn run_persistent(
     perm: PermissionMode,
     cfg: &ShellConfig,
 ) -> Result<String, String> {
+    let spec = shell_spec();
     let dir = &cfg.state_dir;
     std::fs::create_dir_all(dir).map_err(|e| format!("bash: cannot create state dir: {e}"))?;
     let cwd_file = dir.join("cwd");
-    let env_file = dir.join("env");
+    let env_file = dir.join(spec.kind.env_file());
     let out_file = dir.join("out");
     let err_file = dir.join("err");
     // Best-effort clean of prior scratch so we never report stale output.
     let _ = std::fs::remove_file(&out_file);
     let _ = std::fs::remove_file(&err_file);
 
-    let q = |p: &Path| p.to_string_lossy().replace('\'', "'\\''");
-    // Wrapper: restore session cwd/env, run the (raw, unescaped) command with its
-    // output redirected to files, then persist the resulting cwd + exported env.
-    // The command is injected verbatim on its own lines — that's the whole point
-    // (arbitrary shell). Fixed paths are single-quoted; they contain no quotes.
-    let script = format!(
-        "__d=\"$(cat '{cwd}' 2>/dev/null)\"\n\
-         if [ -d \"$__d\" ]; then cd \"$__d\"; else cd '{def}'; fi\n\
-         [ -f '{env}' ] && . '{env}' 2>/dev/null\n\
-         {{\n{cmd}\n}} > '{out}' 2> '{err}'\n\
-         __rc=$?\n\
-         pwd > '{cwd}' 2>/dev/null\n\
-         export -p > '{env}' 2>/dev/null\n\
-         exit $__rc\n",
-        cwd = q(&cwd_file),
-        env = q(&env_file),
-        out = q(&out_file),
-        err = q(&err_file),
-        def = q(default_cwd),
-        cmd = command,
-    );
+    let script =
+        spec.kind.wrapper(command, default_cwd, &cwd_file, &env_file, &out_file, &err_file);
 
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(&script).current_dir(default_cwd);
+    let mut cmd = spec.command(&script);
+    cmd.current_dir(default_cwd);
     apply_env_filter(&mut cmd, perm);
+
+    // PowerShell redirects at the process (see the note above the `wrapper`);
+    // POSIX already sent its own output to these files inside the wrapper.
+    if spec.kind == Shell::PowerShell {
+        let out = std::fs::File::create(&out_file)
+            .map_err(|e| format!("bash: cannot create {}: {e}", out_file.display()))?;
+        let err = std::fs::File::create(&err_file)
+            .map_err(|e| format!("bash: cannot create {}: {e}", err_file.display()))?;
+        cmd.stdout(std::process::Stdio::from(out));
+        cmd.stderr(std::process::Stdio::from(err));
+    }
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("bash: failed to spawn shell: {e}"))?;
+        .map_err(|e| format!("bash: failed to spawn shell ({}): {e}", spec.program.display()))?;
 
     // Poll for completion up to the timeout (0 = unlimited).
     let mut timed_out = false;
@@ -1055,22 +1258,40 @@ mod tests {
 
     #[test]
     fn persistent_shell_keeps_cwd_between_calls() {
+        // What must hold is "the session remembers where it was", not "sh
+        // works" — so the probe is written in whichever shell is resolved.
         let cfg = shell_cfg("cwd", 30);
         let def = std::env::temp_dir();
-        // First command changes directory…
-        let r1 = run_persistent("cd /tmp && echo step1", &def, PermissionMode::Trusted, &cfg).unwrap();
-        assert!(r1.contains("step1"), "r1: {r1}");
-        // …and the next command should already be there.
-        let r2 = run_persistent("pwd", &def, PermissionMode::Trusted, &cfg).unwrap();
-        assert!(r2.contains("tmp"), "cwd should persist to /tmp, got: {r2}");
+        // A directory named for this process, so the assertion cannot be
+        // satisfied by the default cwd.
+        let token = format!("cgu-cwd-{}", std::process::id());
+        let target = def.join(&token);
+        fs::create_dir_all(&target).unwrap();
+
+        let (cd, whereami) = match shell_spec().kind {
+            Shell::Posix => (format!("cd {}", Shell::Posix.quote(&target)), "pwd"),
+            Shell::PowerShell => (
+                format!("Set-Location -LiteralPath {}", Shell::PowerShell.quote(&target)),
+                "(Get-Location).Path",
+            ),
+        };
+
+        run_persistent(&cd, &def, PermissionMode::Trusted, &cfg).unwrap();
+        let r2 = run_persistent(whereami, &def, PermissionMode::Trusted, &cfg).unwrap();
+        let _ = fs::remove_dir_all(&target);
+        assert!(r2.contains(&token), "cwd should persist to {token}, got: {r2}");
     }
 
     #[test]
     fn persistent_shell_keeps_exported_env() {
         let cfg = shell_cfg("env", 30);
         let def = std::env::temp_dir();
-        run_persistent("export GREETING=hi_there_42", &def, PermissionMode::Trusted, &cfg).unwrap();
-        let r = run_persistent("echo $GREETING", &def, PermissionMode::Trusted, &cfg).unwrap();
+        let (set, get) = match shell_spec().kind {
+            Shell::Posix => ("export GREETING=hi_there_42", "echo $GREETING"),
+            Shell::PowerShell => ("$env:GREETING='hi_there_42'", "$env:GREETING"),
+        };
+        run_persistent(set, &def, PermissionMode::Trusted, &cfg).unwrap();
+        let r = run_persistent(get, &def, PermissionMode::Trusted, &cfg).unwrap();
         assert!(r.contains("hi_there_42"), "exported env should persist, got: {r}");
     }
 
@@ -1078,11 +1299,53 @@ mod tests {
     fn persistent_shell_times_out_a_hung_command() {
         let cfg = shell_cfg("timeout", 1);
         let def = std::env::temp_dir();
+        let hang = match shell_spec().kind {
+            Shell::Posix => "sleep 10 && echo done",
+            Shell::PowerShell => "Start-Sleep -Seconds 10; Write-Output done",
+        };
         let start = Instant::now();
-        let r = run_persistent("sleep 10 && echo done", &def, PermissionMode::Trusted, &cfg).unwrap();
+        let r = run_persistent(hang, &def, PermissionMode::Trusted, &cfg).unwrap();
         assert!(start.elapsed() < Duration::from_secs(6), "should be killed near the 1s timeout");
         assert!(r.contains("timed out"), "should report a timeout, got: {r}");
         assert!(!r.contains("done"), "the command should not have completed");
+    }
+
+    #[test]
+    fn the_posix_wrapper_script_is_still_the_one_unix_was_verified_on() {
+        // The shell abstraction must not have quietly rewritten the session
+        // script that the Unix path depends on. Paths are spelled out rather
+        // than `join`ed: `join` would mix separators on Windows and compare
+        // against something the Unix path can never produce.
+        let script = Shell::Posix.wrapper(
+            "echo hi",
+            Path::new("/proj"),
+            Path::new("/state/cwd"),
+            Path::new("/state/env"),
+            Path::new("/state/out"),
+            Path::new("/state/err"),
+        );
+        assert_eq!(
+            script,
+            "__d=\"$(cat '/state/cwd' 2>/dev/null)\"\n\
+             if [ -d \"$__d\" ]; then cd \"$__d\"; else cd '/proj'; fi\n\
+             [ -f '/state/env' ] && . '/state/env' 2>/dev/null\n\
+             {\necho hi\n} > '/state/out' 2> '/state/err'\n\
+             __rc=$?\n\
+             pwd > '/state/cwd' 2>/dev/null\n\
+             export -p > '/state/env' 2>/dev/null\n\
+             exit $__rc\n"
+        );
+    }
+
+    #[test]
+    fn each_shell_quotes_its_own_way() {
+        // A path with a quote in it must not break out of the quoting — the
+        // POSIX form closes and reopens, PowerShell doubles.
+        let odd = Path::new("/tmp/it's here");
+        assert_eq!(Shell::Posix.quote(odd), "'/tmp/it'\\''s here'");
+        assert_eq!(Shell::PowerShell.quote(odd), "'/tmp/it''s here'");
+        // The two shells must not read each other's variable files.
+        assert_ne!(Shell::Posix.env_file(), Shell::PowerShell.env_file());
     }
 
     // --- skill discovery ---

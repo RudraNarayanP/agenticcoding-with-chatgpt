@@ -20,7 +20,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 // Accepted chrome-use binary names, newest name first (mirrors chatgpt-imagegen).
@@ -189,21 +188,36 @@ fn classify(mut e: anyhow::Error, submitted: bool) -> anyhow::Error {
     e.context(ChannelError::new(kind, label).with_submitted(phase))
 }
 
-/// Set by SIGTERM / SIGINT once `install_cancel_handler` has run. Every wait
-/// in a turn watches it, so a cancel is honoured within about a second.
+/// Set by SIGTERM / SIGINT (or Ctrl-C on Windows) once `install_cancel_handler`
+/// has run. Every wait in a turn watches it, so a cancel is honoured within
+/// about a second.
 static CANCEL: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
     std::sync::OnceLock::new();
 
-/// Turn SIGTERM and SIGINT into a graceful cancel of the current request: stop
+/// The receipt path whose cancel marker this process watches, if any. See
+/// [`crate::receipt::request_cancel`] for why a file and not only a signal.
+static CANCEL_MARKER: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Turn a cancel request into a graceful cancel of the current request: stop
 /// its reply and confirm it, instead of dying with the generation still
 /// running. A second signal exits at once. Installed only by `ask
 /// --request-id`, so every other command keeps the default behaviour.
-pub fn install_cancel_handler() {
+///
+/// `marker` is the receipt path to poll for a cooperative cancel; `None` leaves
+/// us with signals only.
+pub fn install_cancel_handler(marker: Option<&std::path::Path>) {
+    if let Some(path) = marker {
+        if let Ok(mut guard) = CANCEL_MARKER.lock() {
+            *guard = Some(path.to_path_buf());
+        }
+        // A marker left by an earlier, unfinished cancel would cancel this turn
+        // before it started.
+        crate::receipt::clear_cancel(path);
+    }
+
     #[cfg(unix)]
     {
-        let flag = CANCEL
-            .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
-            .clone();
+        let flag = cancel_flag();
         for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
             // Order matters: the conditional shutdown sees the flag the first
             // signal is about to set, so only a SECOND signal exits.
@@ -211,10 +225,56 @@ pub fn install_cancel_handler() {
             let _ = signal_hook::flag::register(sig, flag.clone());
         }
     }
+
+    // Windows has no SIGTERM, but a Ctrl-C typed into the owner's own console
+    // is delivered through the console control-handler chain, which is the
+    // closest equivalent. Cross-process cancel is the marker, above.
+    #[cfg(windows)]
+    {
+        // SAFETY: the handler is a `static fn` that outlives every console the
+        // process can be attached to, so it can never be called after being
+        // unloaded. It only touches atomics and, on the second event, exits —
+        // nothing that can be reentrant-unsound here.
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(on_console_ctrl), 1);
+        }
+    }
+}
+
+fn cancel_flag() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    CANCEL
+        .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .clone()
+}
+
+/// Ctrl-C / Ctrl-Break in the owner's console: the first asks for a graceful
+/// stop, the second leaves immediately. Anything else (window close, logoff) we
+/// decline so the default handler still terminates us.
+#[cfg(windows)]
+unsafe extern "system" fn on_console_ctrl(ctrl_type: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    if ctrl_type != CTRL_C_EVENT && ctrl_type != CTRL_BREAK_EVENT {
+        return 0;
+    }
+    let flag = cancel_flag();
+    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+        std::process::exit(130);
+    }
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    1
 }
 
 fn cancel_requested() -> bool {
-    CANCEL.get().is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+    if CANCEL
+        .get()
+        .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+    {
+        return true;
+    }
+    CANCEL_MARKER
+        .lock()
+        .map(|path| path.as_deref().is_some_and(|p| crate::receipt::cancel_marked(p)))
+        .unwrap_or(false)
 }
 
 /// Sleep that wakes early for a cancel.
@@ -2755,9 +2815,16 @@ fn convo_drift(pinned: &str, current: Option<&str>) -> Option<String> {
     }
 }
 
+/// Locate the chrome-use binary: `PATH` first, then `~/.local/bin`.
+///
+/// Both lookups go through the same platform-aware resolver. The first Windows
+/// port searched `PATH` by splitting on `:`, which on Windows is wrong twice
+/// over — entries are separated by `;`, and every entry contains a `:` — so
+/// `chrome-use.exe` sat on `PATH` while `chatgpt-use` reported it as "not
+/// installed".
 fn find_chrome_use() -> Option<PathBuf> {
     for name in AB_BIN_CANDIDATES {
-        if let Some(p) = which_bin(name) {
+        if let Some(p) = crate::util::which(name) {
             return Some(p);
         }
     }
@@ -2765,32 +2832,11 @@ fn find_chrome_use() -> Option<PathBuf> {
     if let Some(home) = crate::util::home_dir() {
         let local_bin = home.join(".local").join("bin");
         for name in AB_BIN_CANDIDATES {
-            let candidate = local_bin.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            #[cfg(windows)]
-            {
-                let candidate = local_bin.join(format!("{name}.exe"));
+            for candidate in crate::util::candidate_paths(&local_bin, name) {
                 if candidate.is_file() {
                     return Some(candidate);
                 }
             }
-        }
-    }
-    None
-}
-
-/// Minimal `which`-equivalent: search PATH for a binary name.
-fn which_bin(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    for dir in path_var.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let p = PathBuf::from(dir).join(name);
-        if p.is_file() {
-            return Some(p);
         }
     }
     None
@@ -2806,7 +2852,7 @@ fn ab_cmd_with_profile(
     profile: Option<&str>,
     _timeout_secs: f64,
 ) -> Result<String> {
-    let mut cmd = Command::new(ab);
+    let mut cmd = crate::util::command_at(ab);
     if let Some(prof) = profile {
         cmd.args(["--profile", prof]);
     }
@@ -3200,10 +3246,12 @@ mod tests {
     }
 
     #[test]
-    fn which_bin_finds_sh_on_unix() {
-        // /bin/sh should always exist on Unix.
-        let result = which_bin("sh");
-        assert!(result.is_some(), "sh should be findable on PATH");
+    fn chrome_use_lookup_finds_a_binary_that_is_really_on_path() {
+        // The PATH search `find_chrome_use` relies on used to be
+        // `split(':')`-and-no-extensions, which finds nothing on Windows. Assert
+        // against a program this test is certainly being run next to.
+        let found = crate::util::which("git").or_else(|| crate::util::which("sh"));
+        assert!(found.is_some_and(|p| p.is_file()), "git or sh should resolve via PATH");
     }
 
     fn typed(kind: ErrorKind) -> anyhow::Error {

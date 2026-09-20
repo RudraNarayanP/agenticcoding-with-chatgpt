@@ -61,6 +61,19 @@ pub fn run(args: &InitArgs) -> Result<()> {
     }
 
     println!("✓ wrote auth token to {}", path.display());
+    // Windows has no mode bits. The file inherits its ACL from the user's
+    // profile directory, which is already per-account on a normal install, so
+    // there is nothing to tighten by default — and a wrong `icacls` on a
+    // domain-joined or roaming-profile machine can lock the owner out of their
+    // own token. Say so rather than pretend to have done it.
+    #[cfg(windows)]
+    println!(
+        "  note: it inherits permissions from {}; restrict it yourself if other \
+         accounts can read that directory.",
+        crate::util::home_dir()
+            .map(|h| h.display().to_string())
+            .unwrap_or_else(|| "your profile".into())
+    );
     println!("  token: {token}");
     println!();
     println!("Next steps:");

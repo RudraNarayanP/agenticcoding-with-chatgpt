@@ -152,7 +152,10 @@ fn build_command(executor: Executor, instruction: &str, cwd: &std::path::Path) -
         Executor::ClaudeCode => ("claude", None),
     };
 
-    let mut cmd = std::process::Command::new(program);
+    // `util::command`, not `Command::new`: both executors are normally npm
+    // shims (`codex.cmd`, `claude.cmd`) on Windows, and `CreateProcessW`
+    // refuses to launch a `.cmd` directly.
+    let mut cmd = crate::util::command(program);
     cmd.current_dir(cwd);
 
     // Codex: `codex exec "<instruction>"`

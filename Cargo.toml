@@ -1,10 +1,13 @@
 [package]
 name = "chatgpt-use"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
+# Measured, not guessed: `cargo check --all-targets` fails on 1.88 (upstream's
+# surface lock uses File::lock, unstable until 1.89) and is clean on 1.89.
+rust-version = "1.89"
 description = "Turn your ChatGPT web subscription into a coding-agent backend — no API key, no Codex billing. Built on chrome-use."
 license = "MIT"
-repository = "https://github.com/leeguooooo/chatgpt-use"
+repository = "https://github.com/RudraNarayanP/agenticcoding-with-chatgpt"
 
 [[bin]]
 name = "chatgpt-use"
@@ -20,6 +23,10 @@ walkdir = "2"
 regex = "1"
 sha2 = "0.10"
 base64 = "0.22"
+# CSPRNG for the MCP auth token and OAuth PKCE verifiers. Already in the graph
+# via jsonschema, so this is a version we were compiling anyway — and it beats
+# a hand-rolled `/dev/urandom` read plus a `RtlGenRandom` FFI declaration.
+getrandom = "0.3"
 # JSON Schema validation for `ask --output-schema`. No default features: those
 # pull an HTTP client (reqwest + a TLS stack) only to fetch remote $refs, which
 # a caller's schema must not need.
@@ -29,6 +36,12 @@ jsonschema = { version = "0.55", default-features = false }
 # confirm it). Only the flag API is used, so no default features.
 [target.'cfg(unix)'.dependencies]
 signal-hook = { version = "0.4", default-features = false }
+
+# The Windows half of the same feature: Ctrl-C arrives through the console
+# control-handler chain rather than as a signal. Only already-in-tree
+# windows-sys, pinned to the version `getrandom` resolves to.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", default-features = false, features = ["Win32_System_Console"] }
 
 [profile.release]
 strip = true

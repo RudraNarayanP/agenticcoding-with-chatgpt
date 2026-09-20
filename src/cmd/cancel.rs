@@ -105,18 +105,31 @@ fn cancel(args: &CancelArgs) -> Value {
 
 /// Signal the live owner and wait for it to record how the cancel ended.
 fn signal_owner(path: &std::path::Path, pid: u32) -> Value {
-    let sent = std::process::Command::new("kill")
+    // The cooperative marker is the request itself: it is the only route that
+    // works on Windows, where there is no way to signal a process on another
+    // console without terminating it.
+    let marked = receipt::request_cancel(path).is_ok();
+
+    // On Unix, SIGTERM as well. The owner's poll would notice the marker within
+    // its own wait interval; the signal is what reaches it promptly from a turn
+    // that is not polling.
+    #[cfg(unix)]
+    let signalled = std::process::Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if !sent {
+    #[cfg(not(unix))]
+    let signalled = false;
+
+    if !(marked || signalled) {
         return json!({"status": "unknown", "error": {"kind": "signal_failed", "message": format!("could not signal owner pid {pid}")}});
     }
     let deadline = Instant::now() + Duration::from_secs(45);
     while Instant::now() < deadline {
         if let Some(r) = receipt::load(path) {
             if matches!(r.state.as_str(), "completed" | "failed") {
+                receipt::clear_cancel(path);
                 return settled(r.outcome.as_deref(), &r.submitted);
             }
         }
@@ -124,7 +137,7 @@ fn signal_owner(path: &std::path::Path, pid: u32) -> Value {
     }
     json!({
         "status": "cancel_requested",
-        "message": format!("signalled owner pid {pid}; it has not recorded an outcome yet"),
+        "message": format!("cancel requested for owner pid {pid}; it has not recorded an outcome yet"),
     })
 }
 
