@@ -23,7 +23,12 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 // Accepted chrome-use binary names, newest name first (mirrors chatgpt-imagegen).
-const AB_BIN_CANDIDATES: &[&str] = &["chrome-use", "agent-browser", "agent-browser-stealth", "abs"];
+const AB_BIN_CANDIDATES: &[&str] = &[
+    "chrome-use",
+    "agent-browser",
+    "agent-browser-stealth",
+    "abs",
+];
 
 const WEB_NEW_CHAT_URL: &str = "https://chatgpt.com/";
 /// One shared chrome-use session name — deliberately NOT per-process.
@@ -146,7 +151,11 @@ pub struct ChannelError {
 
 impl ChannelError {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        ChannelError { kind, submitted: Submitted::No, message: message.into() }
+        ChannelError {
+            kind,
+            submitted: Submitted::No,
+            message: message.into(),
+        }
     }
 
     pub fn with_submitted(mut self, submitted: Submitted) -> Self {
@@ -173,7 +182,11 @@ pub fn channel_error(e: &anyhow::Error) -> Option<&ChannelError> {
 /// takes its `submitted` from the turn, except `Unknown`, which only the
 /// submit step can know and nothing later may downgrade.
 fn classify(mut e: anyhow::Error, submitted: bool) -> anyhow::Error {
-    let phase = if submitted { Submitted::Yes } else { Submitted::No };
+    let phase = if submitted {
+        Submitted::Yes
+    } else {
+        Submitted::No
+    };
     if let Some(ce) = e.downcast_mut::<ChannelError>() {
         if ce.submitted != Submitted::Unknown {
             ce.submitted = phase;
@@ -181,7 +194,10 @@ fn classify(mut e: anyhow::Error, submitted: bool) -> anyhow::Error {
         return e;
     }
     let (kind, label) = if submitted {
-        (ErrorKind::Incomplete, "the prompt was sent but the reply did not complete")
+        (
+            ErrorKind::Incomplete,
+            "the prompt was sent but the reply did not complete",
+        )
     } else {
         (ErrorKind::NotSubmitted, "the prompt was not sent")
     };
@@ -273,7 +289,10 @@ fn cancel_requested() -> bool {
     }
     CANCEL_MARKER
         .lock()
-        .map(|path| path.as_deref().is_some_and(|p| crate::receipt::cancel_marked(p)))
+        .map(|path| {
+            path.as_deref()
+                .is_some_and(|p| crate::receipt::cancel_marked(p))
+        })
         .unwrap_or(false)
 }
 
@@ -857,7 +876,10 @@ pub struct SendOptions {
 impl Default for SendOptions {
     fn default() -> Self {
         // One-shot defaults: ~4s of unchanged text confirms; ~60s of silence aborts.
-        SendOptions { stable_needed: 2, idle_limit: 30 }
+        SendOptions {
+            stable_needed: 2,
+            idle_limit: 30,
+        }
     }
 }
 
@@ -867,7 +889,10 @@ impl SendOptions {
     /// silence before the safety net fires (the wall-clock `timeout_secs` is the
     /// real ceiling).
     pub fn work() -> Self {
-        SendOptions { stable_needed: 3, idle_limit: 90 }
+        SendOptions {
+            stable_needed: 3,
+            idle_limit: 90,
+        }
     }
 }
 
@@ -934,8 +959,16 @@ impl Channel {
         let candidates: Vec<Option<String>> = match profile_lower.as_str() {
             "relay" | "off" | "current" => vec![None],
             "auto" => {
-                // relay first, then any offline-detected logged-in profiles.
-                let mut v: Vec<Option<String>> = vec![None];
+                // Ask chrome-use to pick from the connected browsers first. It
+                // reuses the real logged-in Chrome profile, which is what this
+                // tool needs; on the Windows machine this was found on, the bare
+                // relay below attached to nothing — `open` created the tab and
+                // then every command against it hung — while `--profile auto`
+                // drove the same tab immediately.
+                //
+                // The bare relay stays in the list, second: it is what upstream
+                // verified on macOS, and `relay` above still reaches it directly.
+                let mut v: Vec<Option<String>> = vec![Some("auto".to_string()), None];
                 v.extend(detect_logged_in_profiles().into_iter().map(Some));
                 v
             }
@@ -957,7 +990,20 @@ impl Channel {
         // biting this account counts REQUESTS, not messages, so this is the
         // difference between one run and forty-five as far as it is concerned.
         {
-            let probe = ab_eval(&ab, JS_NEW_CHAT_IN_PLACE, &session, 15.0);
+            // Probed with the profile we are about to open with, not no profile.
+            // chrome-use binds the session daemon to whichever command starts it
+            // and ignores a later `--profile`, so probing over the bare relay
+            // pinned the whole run to a relay that could not attach: the probe
+            // answered, `using current Chrome (relay)` printed, and then every
+            // composer command against the tab hung. The first command has to be
+            // the one that picks the right browser.
+            let probe = ab_eval_with_profile(
+                &ab,
+                JS_NEW_CHAT_IN_PLACE,
+                &session,
+                candidates.first().and_then(|c| c.as_deref()),
+                15.0,
+            );
             let reused = probe
                 .as_ref()
                 .ok()
@@ -984,14 +1030,16 @@ impl Channel {
             // gave a page whose composer never appeared, and an unchanged rerun
             // seconds later worked. So a candidate whose page merely failed to
             // render gets one more try before we move on.
-            let mut opened_now = try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
+            let mut opened_now =
+                try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
             if matches!(opened_now, Ok(false)) {
                 let (login, what) = page_probe(&ab, &session);
                 if !login {
                     eprintln!("the ChatGPT page never showed its composer ({what}); retrying once");
                     ab_close(&ab, &session);
                     std::thread::sleep(Duration::from_secs(3));
-                    opened_now = try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
+                    opened_now =
+                        try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
                 }
             }
             match opened_now {
@@ -1016,7 +1064,9 @@ impl Channel {
                     ab_close(&ab, &session);
                     let msg = e.to_string();
                     if msg.contains("rate-limited") || msg.contains("Too many") {
-                        return Err(ChannelError::new(ErrorKind::RateLimited, RATE_LIMIT_MSG).into());
+                        return Err(
+                            ChannelError::new(ErrorKind::RateLimited, RATE_LIMIT_MSG).into()
+                        );
                     }
                     // A chrome-use session name can go temporarily unusable: a
                     // command that runs too long is judged unresponsive and its
@@ -1031,8 +1081,10 @@ impl Channel {
                     // chatgpt.com" tells the user to fix the one thing that is
                     // not broken. Say what happened and give a way through now.
                     if msg.contains("session unresponsive") || msg.contains("stuck") {
-                        return Err(ChannelError::new(ErrorKind::SessionUnavailable, format!(
-                            "the chrome-use session {session:?} is wedged — every command on \
+                        return Err(ChannelError::new(
+                            ErrorKind::SessionUnavailable,
+                            format!(
+                                "the chrome-use session {session:?} is wedged — every command on \
                              that name is returning \"session unresponsive\". You are still \
                              signed in; this is not a login problem.\n\n  Use another name \
                              meanwhile:  chatgpt-use <cmd> --session chatgpt-web-2\n\n\
@@ -1040,7 +1092,8 @@ impl Channel {
                              `keyboard inserttext`, say) being judged unresponsive. The name \
                              frees itself later — about an hour, in the case we measured — so \
                              the original is worth retrying rather than abandoning."
-                        ))
+                            ),
+                        )
                         .into());
                     }
                     // other errors: log and try the next candidate
@@ -1108,8 +1161,13 @@ impl Channel {
                         );
                         chan.pending_project = Some(gizmo);
                         let restore_deadline = Instant::now() + Duration::from_secs(30);
-                        let _ =
-                            ab_open(&chan.ab, &chan.session, WEB_NEW_CHAT_URL, None, restore_deadline);
+                        let _ = ab_open(
+                            &chan.ab,
+                            &chan.session,
+                            WEB_NEW_CHAT_URL,
+                            None,
+                            restore_deadline,
+                        );
                         let _ = wait_composer(&chan.ab, &chan.session, restore_deadline, 15);
                     }
                 }
@@ -1179,7 +1237,9 @@ impl Channel {
                 .filter(|v| v.is_object())
                 .map(|v| {
                     v.get("stop").and_then(|b| b.as_bool()).unwrap_or(false)
-                        || v.get("tool_active").and_then(|b| b.as_bool()).unwrap_or(false)
+                        || v.get("tool_active")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false)
                 })
                 .unwrap_or(false)
         };
@@ -1200,7 +1260,9 @@ impl Channel {
             // help; reloading the conversation does. This is the same trade the
             // rest of the channel makes: the record is authoritative, the page
             // is just a keyboard, and a keyboard that has locked up gets reset.
-            eprintln!("the page is stuck mid-generation; reloading the conversation to free the composer");
+            eprintln!(
+                "the page is stuck mid-generation; reloading the conversation to free the composer"
+            );
             if self.convo_id.is_some() {
                 self.reopen_pinned(budget)
                     .context("reloading a page stuck mid-generation")?;
@@ -1209,8 +1271,13 @@ impl Channel {
         }
 
         // Focus and empty the composer, then insert the message as TEXT.
-        ab_cmd(&self.ab, &["click", "#prompt-textarea"], &self.session, budget)
-            .context("clicking #prompt-textarea")?;
+        ab_cmd(
+            &self.ab,
+            &["click", "#prompt-textarea"],
+            &self.session,
+            budget,
+        )
+        .context("clicking #prompt-textarea")?;
         // Clear, then CONFIRM the composer is actually empty. One `delete` is not
         // enough after a reattach: the page may still be hydrating, and ChatGPT
         // restores a saved draft into the composer once it is — which silently
@@ -1265,8 +1332,14 @@ impl Channel {
         // leeguooooo/chrome-use#301 does to chunked inserts.
         let (want_n, want_h) = composer_fingerprint(message);
         let got = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget).ok();
-        let got_n = got.as_ref().and_then(|v| v.get("n")).and_then(|v| v.as_u64());
-        let got_h = got.as_ref().and_then(|v| v.get("h")).and_then(|v| v.as_u64());
+        let got_n = got
+            .as_ref()
+            .and_then(|v| v.get("n"))
+            .and_then(|v| v.as_u64());
+        let got_h = got
+            .as_ref()
+            .and_then(|v| v.get("h"))
+            .and_then(|v| v.as_u64());
         if let (Some(n), Some(h)) = (got_n, got_h) {
             if n != want_n {
                 bail!(
@@ -1367,7 +1440,10 @@ impl Channel {
         if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             return Ok(());
         }
-        let detail = res.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let detail = res
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
 
         // This is the one place a remembered gizmo id gets tested against the
         // server, so it is where a stale one has to be dropped. A project that
@@ -1400,7 +1476,9 @@ impl Channel {
     /// the multi-turn modes rely on context accumulated in the pinned chat, so
     /// answering from a different one is worse than erroring.
     fn verify_convo(&self, budget: f64) -> Result<()> {
-        let Some(ref pinned) = self.convo_id else { return Ok(()) };
+        let Some(ref pinned) = self.convo_id else {
+            return Ok(());
+        };
         if convo_drift(pinned, self.current_convo_id(budget).as_deref()).is_none() {
             return Ok(());
         }
@@ -1722,10 +1800,15 @@ impl Channel {
 
         // Snapshot the current number of assistant messages so we can detect
         // when a NEW one arrives.
-        let baseline_count: u64 = ab_eval(&self.ab, JS_ASSISTANT_COUNT, &self.session, remaining_secs())
-            .ok()
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let baseline_count: u64 = ab_eval(
+            &self.ab,
+            JS_ASSISTANT_COUNT,
+            &self.session,
+            remaining_secs(),
+        )
+        .ok()
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
         // Fill + submit, with ONE reattach-and-retry: the tab can vanish between
         // turns (closed, crashed, browser restarted) and the conversation itself
@@ -1781,10 +1864,15 @@ impl Channel {
         // Re-read the assistant baseline: if we reattached above, the reloaded
         // page reflects the server's view and the pre-crash count is meaningless.
         let baseline_count = baseline_count.min(
-            ab_eval(&self.ab, JS_ASSISTANT_COUNT, &self.session, remaining_secs())
-                .ok()
-                .and_then(|v| v.as_u64())
-                .unwrap_or(baseline_count),
+            ab_eval(
+                &self.ab,
+                JS_ASSISTANT_COUNT,
+                &self.session,
+                remaining_secs(),
+            )
+            .ok()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(baseline_count),
         );
 
         // Poll until the stop button is gone AND a new assistant message count
@@ -1980,7 +2068,9 @@ impl Channel {
                 nap(backoff);
                 if let Some(text) = self.server_verdict(remaining_secs().min(30.0))? {
                     if !text.trim().is_empty() {
-                        eprintln!("the turn completed despite the throttle; taking it from the record");
+                        eprintln!(
+                            "the turn completed despite the throttle; taking it from the record"
+                        );
                         return self.finish_turn(text, remaining_secs());
                     }
                 }
@@ -1988,7 +2078,10 @@ impl Channel {
             }
 
             let stop = st.get("stop").and_then(|v| v.as_bool()).unwrap_or(false);
-            let tool_active = st.get("tool_active").and_then(|v| v.as_bool()).unwrap_or(false);
+            let tool_active = st
+                .get("tool_active")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let cur_count = st
                 .get("assistant_count")
                 .and_then(|v| v.as_u64())
@@ -2030,7 +2123,10 @@ impl Channel {
                 } else {
                     "waiting for reply"
                 };
-                eprintln!("[{elapsed:5}.0s] {phase} (msgs={cur_count}, len={})", atext.len());
+                eprintln!(
+                    "[{elapsed:5}.0s] {phase} (msgs={cur_count}, len={})",
+                    atext.len()
+                );
             }
 
             if !atext.is_empty() {
@@ -2096,16 +2192,11 @@ impl Channel {
         }
 
         // Scrape the last assistant message — prefer innerText (rendered markdown).
-        let reply_text = ab_eval(
-            &self.ab,
-            JS_LAST_ASSISTANT,
-            &self.session,
-            remaining_secs(),
-        )
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| last_atext.clone());
+        let reply_text = ab_eval(&self.ab, JS_LAST_ASSISTANT, &self.session, remaining_secs())
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| last_atext.clone());
 
         self.finish_turn(reply_text, remaining_secs())
     }
@@ -2275,9 +2366,20 @@ impl Channel {
             if Instant::now() >= deadline {
                 break;
             }
-            if let Ok(st) = ab_eval(&self.ab, &js_project_ready, &self.session, remaining().min(20.0)) {
-                let composer = st.get("composer").and_then(|v| v.as_bool()).unwrap_or(false);
-                let in_project = st.get("in_project").and_then(|v| v.as_bool()).unwrap_or(false);
+            if let Ok(st) = ab_eval(
+                &self.ab,
+                &js_project_ready,
+                &self.session,
+                remaining().min(20.0),
+            ) {
+                let composer = st
+                    .get("composer")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let in_project = st
+                    .get("in_project")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if composer && in_project {
                     ready = true;
                     break;
@@ -2338,7 +2440,10 @@ impl Channel {
             }
         }
         if !pick.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let detail = pick.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let detail = pick
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             bail!("could not find the composer model picker: {detail}");
         }
         let (px, py) = match (
@@ -2348,8 +2453,13 @@ impl Channel {
             (Some(x), Some(y)) => (x, y),
             _ => bail!("composer model picker has no usable coordinates"),
         };
-        ab_cmd(&self.ab, &["click", &px.to_string(), &py.to_string()], &self.session, remaining())
-            .context("opening the composer model picker")?;
+        ab_cmd(
+            &self.ab,
+            &["click", &px.to_string(), &py.to_string()],
+            &self.session,
+            remaining(),
+        )
+        .context("opening the composer model picker")?;
         std::thread::sleep(Duration::from_millis(500));
 
         let st = ab_eval(&self.ab, JS_PICKER_MENU, &self.session, remaining())?;
@@ -2404,12 +2514,21 @@ impl Channel {
         // A real click on the thumb; this focuses the slider WITHOUT closing the
         // menu, which `press --selector` does not manage (focusing through a
         // selector dismisses the popover and the arrow keys go nowhere).
-        ab_cmd(&self.ab, &["click", &tx.to_string(), &ty.to_string()], &self.session, remaining())
-            .context("focusing the thinking-effort slider")?;
+        ab_cmd(
+            &self.ab,
+            &["click", &tx.to_string(), &ty.to_string()],
+            &self.session,
+            remaining(),
+        )
+        .context("focusing the thinking-effort slider")?;
         std::thread::sleep(Duration::from_millis(300));
 
         let target = idx as i64;
-        let key = if target >= now { "ArrowRight" } else { "ArrowLeft" };
+        let key = if target >= now {
+            "ArrowRight"
+        } else {
+            "ArrowLeft"
+        };
         for _ in 0..(target - now).abs() {
             ab_cmd(&self.ab, &["press", key], &self.session, remaining())
                 .context("moving the thinking-effort slider")?;
@@ -2432,8 +2551,16 @@ impl Channel {
             );
         }
         let shown = after.get("level").and_then(|v| v.as_str()).unwrap_or("");
-        eprintln!("model: {} (slider {}{})", LEVEL_ORDER[idx], target,
-            if shown.is_empty() { String::new() } else { format!(", shown as {shown:?}") });
+        eprintln!(
+            "model: {} (slider {}{})",
+            LEVEL_ORDER[idx],
+            target,
+            if shown.is_empty() {
+                String::new()
+            } else {
+                format!(", shown as {shown:?}")
+            }
+        );
         Ok(())
     }
 
@@ -2445,21 +2572,39 @@ impl Channel {
         remaining: &dyn Fn() -> f64,
     ) -> Result<()> {
         let empty = vec![];
-        let radios = st.get("radios").and_then(|v| v.as_array()).unwrap_or(&empty);
+        let radios = st
+            .get("radios")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&empty);
         let names: Vec<String> = radios
             .iter()
-            .filter_map(|r| r.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter_map(|r| {
+                r.get("text")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect();
         let wl = want.to_lowercase();
-        let hit = names.iter().find(|n| n.to_lowercase() == wl).cloned().or_else(|| {
-            names.iter().find(|n| n.to_lowercase().contains(&wl)).cloned()
-        });
+        let hit = names
+            .iter()
+            .find(|n| n.to_lowercase() == wl)
+            .cloned()
+            .or_else(|| {
+                names
+                    .iter()
+                    .find(|n| n.to_lowercase().contains(&wl))
+                    .cloned()
+            });
         let Some(hit) = hit else {
             bail!(
                 "{want:?} is neither a thinking-effort level ({}) nor one of the \\
                  models this account offers ({})",
                 LEVEL_ORDER.join(", "),
-                if names.is_empty() { "none listed".to_string() } else { names.join(", ") }
+                if names.is_empty() {
+                    "none listed".to_string()
+                } else {
+                    names.join(", ")
+                }
             );
         };
 
@@ -2470,7 +2615,6 @@ impl Channel {
         eprintln!("model: {hit}");
         Ok(())
     }
-
 }
 
 // ---- chrome-use helpers (mirrors _ab / _ab_eval in chatgpt-imagegen) --------
@@ -2501,8 +2645,11 @@ impl SubmitFailure {
                     return e;
                 }
                 e.context(
-                    ChannelError::new(ErrorKind::SubmitUnknown, "the prompt may or may not have been sent")
-                        .with_submitted(Submitted::Unknown),
+                    ChannelError::new(
+                        ErrorKind::SubmitUnknown,
+                        "the prompt may or may not have been sent",
+                    )
+                    .with_submitted(Submitted::Unknown),
                 )
             }
         }
@@ -2647,7 +2794,9 @@ impl SurfaceLock {
         // Best-effort: a lock we hold but could not stamp is still a good lock.
         let _ = file
             .seek(std::io::SeekFrom::Start(0))
-            .and_then(|_| file.write_all(format!("chatgpt-use {}\n", std::process::id()).as_bytes()))
+            .and_then(|_| {
+                file.write_all(format!("chatgpt-use {}\n", std::process::id()).as_bytes())
+            })
             .and_then(|_| file.flush());
 
         Ok(SurfaceLock { _file: Some(file) })
@@ -2739,12 +2888,17 @@ fn cached_gizmo(name: &str) -> Option<String> {
 }
 
 fn remember_gizmo(name: &str, gizmo_id: &str) {
-    let Some(path) = project_cache_path() else { return };
+    let Some(path) = project_cache_path() else {
+        return;
+    };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let mut map = read_project_cache();
-    map.insert(name.to_string(), serde_json::Value::String(gizmo_id.to_string()));
+    map.insert(
+        name.to_string(),
+        serde_json::Value::String(gizmo_id.to_string()),
+    );
     if let Ok(text) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
         let _ = std::fs::write(path, text);
     }
@@ -2753,7 +2907,9 @@ fn remember_gizmo(name: &str, gizmo_id: &str) {
 /// Drop a remembered id after it turns out not to work — a deleted project, or
 /// one that belongs to a different account than the browser is now signed into.
 fn forget_gizmo(name: &str) {
-    let Some(path) = project_cache_path() else { return };
+    let Some(path) = project_cache_path() else {
+        return;
+    };
     let mut map = read_project_cache();
     if map.remove(name).is_some() {
         if let Ok(text) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
@@ -2905,13 +3061,25 @@ fn ab_cmd(ab: &PathBuf, args: &[&str], session: &str, timeout_secs: f64) -> Resu
 /// Convention (mirrors `_ab_eval`): the JS does `return JSON.stringify(value)`;
 /// chrome-use prints THAT string JSON-encoded, so we decode twice — once to get
 /// the inner JSON text, once to parse it into a value.
-fn ab_eval(
+fn ab_eval(ab: &PathBuf, js: &str, session: &str, timeout_secs: f64) -> Result<serde_json::Value> {
+    ab_eval_with_profile(ab, js, session, None, timeout_secs)
+}
+
+/// As [`ab_eval`], but choosing the Chrome profile for the call.
+///
+/// This matters beyond the one call: chrome-use binds a session's daemon to the
+/// profile of whichever command started it, and afterwards reports "`--profile`
+/// ignored: daemon already running". So the *first* command of a run decides
+/// which browser every later command reaches, whether or not it was the one we
+/// wanted.
+fn ab_eval_with_profile(
     ab: &PathBuf,
     js: &str,
     session: &str,
+    profile: Option<&str>,
     timeout_secs: f64,
 ) -> Result<serde_json::Value> {
-    let raw = ab_cmd(ab, &["eval", js], session, timeout_secs)?;
+    let raw = ab_cmd_with_profile(ab, &["eval", js], session, profile, timeout_secs)?;
 
     // Scan from the last non-empty line for the first that decodes to a string.
     for line in raw.lines().rev() {
@@ -2983,7 +3151,10 @@ fn page_probe(ab: &PathBuf, session: &str) -> (bool, String) {
         Ok(v) => {
             let login = v.get("login").and_then(|b| b.as_bool()).unwrap_or(false);
             let field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-            (login, format!("path {:?}, title {:?}", field("path"), field("title")))
+            (
+                login,
+                format!("path {:?}, title {:?}", field("path"), field("title")),
+            )
         }
         Err(e) => (false, format!("page unreadable: {e}")),
     }
@@ -2992,12 +3163,7 @@ fn page_probe(ab: &PathBuf, session: &str) -> (bool, String) {
 /// Poll until `#prompt-textarea` is on the page (mirrors `_wait_composer`).
 /// Returns `Ok(true)` when the composer is ready, `Ok(false)` on timeout.
 /// Bails with an error if the rate-limit dialog is detected.
-fn wait_composer(
-    ab: &PathBuf,
-    session: &str,
-    deadline: Instant,
-    tries: u32,
-) -> Result<bool> {
+fn wait_composer(ab: &PathBuf, session: &str, deadline: Instant, tries: u32) -> Result<bool> {
     for _ in 0..tries {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -3011,7 +3177,11 @@ fn wait_composer(
                 if st.get("limited").and_then(|v| v.as_bool()).unwrap_or(false) {
                     return Err(ChannelError::new(ErrorKind::RateLimited, RATE_LIMIT_MSG).into());
                 }
-                if st.get("composer").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if st
+                    .get("composer")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     return Ok(true);
                 }
             }
@@ -3137,15 +3307,24 @@ mod tests {
     fn composer_fingerprint_detects_reordering_at_equal_length() {
         let (n1, h1) = composer_fingerprint("abcdef");
         let (n2, h2) = composer_fingerprint("abcdfe");
-        assert_eq!(n1, n2, "the failure mode under test keeps the count identical");
-        assert_ne!(h1, h2, "a reordered payload must not pass the integrity check");
+        assert_eq!(
+            n1, n2,
+            "the failure mode under test keeps the count identical"
+        );
+        assert_ne!(
+            h1, h2,
+            "a reordered payload must not pass the integrity check"
+        );
         assert_eq!((n1, h1), (6, 829399410));
         assert_eq!((n2, h2), (6, 793662762));
     }
 
     #[test]
     fn holder_label_reads_tool_and_pid() {
-        assert_eq!(holder_label("chatgpt-imagegen 4321\n"), "chatgpt-imagegen (pid 4321)");
+        assert_eq!(
+            holder_label("chatgpt-imagegen 4321\n"),
+            "chatgpt-imagegen (pid 4321)"
+        );
     }
 
     /// The case that caught the O_APPEND bug on the imagegen side: a PREVIOUS
@@ -3222,8 +3401,14 @@ mod tests {
     #[test]
     fn js_ensure_project_embeds_name() {
         let js = js_ensure_project("my-project");
-        assert!(js.contains("my-project"), "JS should embed the project name");
-        assert!(js.contains("backend-api/projects"), "JS should reference the project API");
+        assert!(
+            js.contains("my-project"),
+            "JS should embed the project name"
+        );
+        assert!(
+            js.contains("backend-api/projects"),
+            "JS should reference the project API"
+        );
     }
 
     #[test]
@@ -3244,8 +3429,7 @@ mod tests {
         // Reproduce the decode loop from ab_eval.
         let inner: serde_json::Value = serde_json::from_str(&chrome_use_line).unwrap();
         assert!(inner.is_string());
-        let second: serde_json::Value =
-            serde_json::from_str(inner.as_str().unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(inner.as_str().unwrap()).unwrap();
         assert_eq!(second["key"], "val");
     }
 
@@ -3255,7 +3439,10 @@ mod tests {
         // `split(':')`-and-no-extensions, which finds nothing on Windows. Assert
         // against a program this test is certainly being run next to.
         let found = crate::util::which("git").or_else(|| crate::util::which("sh"));
-        assert!(found.is_some_and(|p| p.is_file()), "git or sh should resolve via PATH");
+        assert!(
+            found.is_some_and(|p| p.is_file()),
+            "git or sh should resolve via PATH"
+        );
     }
 
     fn typed(kind: ErrorKind) -> anyhow::Error {
@@ -3264,27 +3451,44 @@ mod tests {
 
     #[test]
     fn channel_error_survives_context_layers() {
-        let e = typed(ErrorKind::RateLimited).context("resubmitting").context("outer");
-        assert_eq!(channel_error(&e).map(|c| c.kind), Some(ErrorKind::RateLimited));
+        let e = typed(ErrorKind::RateLimited)
+            .context("resubmitting")
+            .context("outer");
+        assert_eq!(
+            channel_error(&e).map(|c| c.kind),
+            Some(ErrorKind::RateLimited)
+        );
     }
 
     #[test]
     fn untyped_failures_are_typed_by_how_far_the_turn_got() {
         let before = classify(anyhow!("tab vanished"), false);
         let ce = channel_error(&before).unwrap();
-        assert_eq!((ce.kind, ce.submitted), (ErrorKind::NotSubmitted, Submitted::No));
-        assert!(format!("{before:#}").contains("tab vanished"), "the cause is kept");
+        assert_eq!(
+            (ce.kind, ce.submitted),
+            (ErrorKind::NotSubmitted, Submitted::No)
+        );
+        assert!(
+            format!("{before:#}").contains("tab vanished"),
+            "the cause is kept"
+        );
 
         let after = classify(anyhow!("page swapped"), true);
         let ce = channel_error(&after).unwrap();
-        assert_eq!((ce.kind, ce.submitted), (ErrorKind::Incomplete, Submitted::Yes));
+        assert_eq!(
+            (ce.kind, ce.submitted),
+            (ErrorKind::Incomplete, Submitted::Yes)
+        );
     }
 
     #[test]
     fn a_typed_failure_keeps_its_kind_and_takes_the_turn_phase() {
         let e = classify(typed(ErrorKind::RateLimited).context("while polling"), true);
         let ce = channel_error(&e).unwrap();
-        assert_eq!((ce.kind, ce.submitted), (ErrorKind::RateLimited, Submitted::Yes));
+        assert_eq!(
+            (ce.kind, ce.submitted),
+            (ErrorKind::RateLimited, Submitted::Yes)
+        );
     }
 
     #[test]
@@ -3299,15 +3503,27 @@ mod tests {
         let e = SubmitFailure::Ambiguous(typed(ErrorKind::RateLimited)).into_error();
         let e = classify(e, false);
         let ce = channel_error(&e).unwrap();
-        assert_eq!((ce.kind, ce.submitted), (ErrorKind::RateLimited, Submitted::Unknown));
+        assert_eq!(
+            (ce.kind, ce.submitted),
+            (ErrorKind::RateLimited, Submitted::Unknown)
+        );
     }
 
     #[test]
     fn no_failure_maps_to_completed() {
         use ErrorKind::*;
         for k in [
-            LoginRequired, RateLimited, SessionUnavailable, PageBlocked, NotSubmitted, SubmitUnknown,
-            Incomplete, Busy, Duplicate, Cancelled, CancelRequested,
+            LoginRequired,
+            RateLimited,
+            SessionUnavailable,
+            PageBlocked,
+            NotSubmitted,
+            SubmitUnknown,
+            Incomplete,
+            Busy,
+            Duplicate,
+            Cancelled,
+            CancelRequested,
         ] {
             assert_ne!(k.status(), "completed", "{k:?}");
         }
@@ -3327,10 +3543,18 @@ mod tests {
     #[test]
     fn a_stopped_turn_is_incomplete_not_a_reply() {
         // Exactly what the record showed after the stop button, live.
-        let e = judge_record(turn(true, "partial essay", Some("interrupted"), Some("client_stopped")))
-            .unwrap_err();
+        let e = judge_record(turn(
+            true,
+            "partial essay",
+            Some("interrupted"),
+            Some("client_stopped"),
+        ))
+        .unwrap_err();
         let ce = channel_error(&e).unwrap();
-        assert_eq!((ce.kind, ce.submitted), (ErrorKind::Incomplete, Submitted::Yes));
+        assert_eq!(
+            (ce.kind, ce.submitted),
+            (ErrorKind::Incomplete, Submitted::Yes)
+        );
         assert!(e.to_string().contains("client_stopped"), "{e}");
 
         let e = judge_record(turn(true, "", Some("max_tokens"), None)).unwrap_err();
@@ -3339,18 +3563,36 @@ mod tests {
 
     #[test]
     fn a_real_finish_is_a_reply_and_an_open_turn_is_not_yet() {
-        assert_eq!(judge_record(turn(true, "done", Some("stop"), None)).unwrap(), Some("done".into()));
+        assert_eq!(
+            judge_record(turn(true, "done", Some("stop"), None)).unwrap(),
+            Some("done".into())
+        );
         // An unknown finish type is not treated as a failure.
-        assert_eq!(judge_record(turn(true, "done", Some("new_kind"), None)).unwrap(), Some("done".into()));
-        assert_eq!(judge_record(turn(true, "done", None, None)).unwrap(), Some("done".into()));
-        assert_eq!(judge_record(turn(false, "streaming", None, None)).unwrap(), None);
-        assert_eq!(judge_record(turn(true, "  ", Some("stop"), None)).unwrap(), None);
+        assert_eq!(
+            judge_record(turn(true, "done", Some("new_kind"), None)).unwrap(),
+            Some("done".into())
+        );
+        assert_eq!(
+            judge_record(turn(true, "done", None, None)).unwrap(),
+            Some("done".into())
+        );
+        assert_eq!(
+            judge_record(turn(false, "streaming", None, None)).unwrap(),
+            None
+        );
+        assert_eq!(
+            judge_record(turn(true, "  ", Some("stop"), None)).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn the_record_walk_stops_at_this_turns_prompt() {
         let js = js_server_final("c-1");
-        assert!(js.contains("m.author.role === 'user') break"), "must not reach the previous turn");
+        assert!(
+            js.contains("m.author.role === 'user') break"),
+            "must not reach the previous turn"
+        );
         assert!(js.contains("finish_details"));
     }
 
