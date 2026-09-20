@@ -23,8 +23,10 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest,   shell: '' }
-          - { os: macos-14,        shell: '' }
-          - { os: macos-15-intel,  shell: '' }
+          # Only labels GitHub actually offers. An Intel macOS *runner* is not
+          # one of them - x86_64-apple-darwin is covered by the release workflow,
+          # which cross-builds it on the arm64 runner.
+          - { os: macos-latest,    shell: '' }
           # Both Windows shell paths run the same suite. The bash tool resolves
           # to Git for Windows' sh on a GitHub runner, so without the second job
           # the PowerShell fallback - the only path on a machine with no Git -
@@ -69,7 +71,12 @@ jobs:
           n=$(cargo fmt --all --check 2>&1 | grep -c '^Diff' || true)
           echo "cargo fmt --check: $n hunks would change"
       - name: Clippy
-        run: cargo clippy --all-targets 2>&1 | grep -c '^warning: ' | xargs -I{} echo "clippy: {} warnings"
+        # Block scalar, not a plain `run: ...` line: the message contains
+        # "clippy: ", and a colon-space inside a plain YAML scalar is a parse
+        # error - which fails the whole workflow before any job is created.
+        run: |
+          n=$(cargo clippy --all-targets 2>&1 | grep -c '^warning: ' || true)
+          echo "clippy: $n warnings"
 
   # Guards the one class of bug that a host-only check cannot see: code under
   # #[cfg(unix)] / #[cfg(windows)] that only compiles on the other platform.
@@ -89,3 +96,20 @@ jobs:
       # the cfg branches of a platform the job's own OS is not.
       - name: Type-check the foreign cfg branches
         run: cargo check --all-targets --target ${{ matrix.target }}
+
+  # This file shipped broken twice in a row, and neither failure was visible as a
+  # test result: a plain `run:` scalar containing "clippy: " is a YAML parse
+  # error, which kills the run before any job is created, so the workflow just
+  # disappears; and `macos-15-intel` is a runner label that does not exist. A
+  # workflow cannot check its own syntax by running, so this checks all of them.
+  workflow-lint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate every workflow file
+        run: |
+          ver=1.7.7
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz" -o al.tgz
+          tar -xzf al.tgz actionlint
+          ./actionlint .github/workflows/*.yml
