@@ -62,25 +62,39 @@ impl Message {
 
 /// Free-tier models worth using as an executor, best-first.
 ///
-/// Hardcoding one *id* is how the first version of this shipped a default that
-/// no longer exists: OpenRouter's free lineup turns over, and a name that was
-/// right last month makes the first real call fail with a model-not-found. So
-/// this is a ranked shortlist, and [`Client::resolve_model`] checks it against
-/// `/api/v1/models` (public, keyless) before using it.
+/// Order is by *observed behaviour*, not by reputation, because being listed in
+/// `/api/v1/models` turned out not to mean being servable: at the time this was
+/// written `qwen/qwen3.8-27b:free`, `z-ai/glm-5.2:free` and
+/// `google/gemma-4-31b-it:free` all answered "Provider returned error", and
+/// `thinkingmachines/*` is gated on age verification. `poolside/laguna-s-2.1:free`
+/// was the first that both served and obeyed a "reply with only X" instruction --
+/// the exact discipline this protocol needs. Nemotron serves but narrates.
 ///
-/// Chosen for following a rigid one-line-JSON instruction, since that is the
-/// whole job: emit the next tool call, not explain it. The text tool protocol
-/// means none of these needs native tool-calling support.
+/// Even this order decays, so [`pick_usable`] probes before choosing rather than
+/// trusting the list.
 pub const PREFERRED_FREE_MODELS: &[&str] = &[
-    "qwen/qwen3.8-27b:free",
-    "z-ai/glm-5.2:free",
     "poolside/laguna-s-2.1:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
-    "thinkingmachines/inkling-small:free",
+    "qwen/qwen3.8-27b:free",
+    "z-ai/glm-5.2:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
 ];
 
 /// Back-compat name for tests and error text: the head of the shortlist.
 pub const DEFAULT_MODEL: &str = PREFERRED_FREE_MODELS[0];
+
+/// First candidate for which `probe` succeeds.
+///
+/// Injectable as a closure precisely so the *selection* is unit-testable without
+/// a key or a network: the real probe makes a completion, the test probe is a
+/// HashSet. Free-tier providers flake independently of OpenRouter, so "is it
+/// listed" is the wrong question; "does it answer" is the right one.
+pub fn pick_usable<'a, F>(candidates: &[&'a str], mut probe: F) -> Option<&'a str>
+where
+    F: FnMut(&str) -> bool,
+{
+    candidates.iter().copied().find(|m| probe(m))
+}
 
 /// The live catalogue of free-tier model ids, or `None` if it could not be
 /// reached. Keyless and unrelated to chatgpt.com, so this costs no plan quota.
@@ -111,33 +125,91 @@ pub fn free_models() -> Option<Vec<String>> {
     }
 }
 
-/// Pick the executor model without trusting a hardcoded name.
+/// One small completion, to ask a model "are you serving right now".
 ///
-/// One keyless catalogue call turns "the default rotted" into a non-event. If the
-/// catalogue is unreachable, the head of the shortlist is still the best guess
-/// available -- but say so, because a stale default failing at 2am looks like a
-/// broken tool rather than a renamed model.
-fn resolve_model() -> String {
-    match free_models() {
-        Some(catalogue) => {
-            if let Some(pick) = PREFERRED_FREE_MODELS
-                .iter()
-                .find(|m| catalogue.iter().any(|c| c.as_str() == **m))
-            {
-                pick.to_string()
-            } else {
-                let first = catalogue[0].clone();
-                eprintln!(
-                    "warning: none of the preferred free models is listed by OpenRouter any \
-                     more; falling back to {first}. Override with --exec-model."
-                );
-                first
-            }
+/// The budget is 64 tokens, not a tiny handful, and that number is load-bearing:
+/// several free models reason before they emit, so a tight cap starves them into
+/// `Provider returned error` and a 4-token probe reports a perfectly usable model
+/// as dead. Measured on `poolside/laguna-s-2.1:free`: fails at 4 and 16, answers
+/// at 64. The retry exists for the same reason -- free providers flap.
+///
+/// Probing rather than trusting the model list is deliberate: the list reflects
+/// what OpenRouter offers, not what is answering at this moment.
+fn serves(api_key: &str, model: &str) -> bool {
+    let Some(curl) = crate::util::which("curl") else { return false };
+    let mut cmd = crate::util::command_at(&curl);
+    cmd.args(["--silent", "--show-error", "--max-time", "25", "--request", "POST"])
+        .args(["--header", &format!("Authorization: Bearer {api_key}"), "--header", "Content-Type: application/json"])
+        .args([
+            "--data-binary",
+            &format!(
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"Reply with only: ok"}}],"max_tokens":64,"temperature":0}}"#
+            ),
+        ])
+        .arg("https://openrouter.ai/api/v1/chat/completions");
+    let answer = |cmd: &mut std::process::Command| match crate::util::run_bounded(cmd, 60.0) {
+        Ok(out) if out.status.success() => {
+            let v = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok()?;
+            // An `error` object with no choices is a provider failure, and a model
+            // that returns empty content is no use as an executor either.
+            (v.pointer("/error").is_none()
+                && v.pointer("/choices/0/message/content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| !c.trim().is_empty()))
+            .then_some(())
         }
+        _ => None,
+    };
+    answer(&mut cmd).is_some() || answer(&mut cmd).is_some()
+}
+
+/// Pick the executor model by asking, not by trusting a name.
+///
+/// The shortlist is probed in order -- at most a handful of 4-token calls, and
+/// only when the caller did not name a model -- then anything else the catalogue
+/// lists as free is taken unprobed rather than looping the whole catalogue. If
+/// nothing answers, the head of the shortlist is returned with a warning: better
+/// a loud guess than a silent hang.
+fn resolve_model(api_key: &str) -> String {
+    let catalogue = free_models();
+    let mut candidates: Vec<String> = match &catalogue {
+        Some(cat) => PREFERRED_FREE_MODELS
+            .iter()
+            .filter(|m| cat.iter().any(|c| c.as_str() == **m))
+            .map(|m| (*m).to_string())
+            .collect(),
+        None => PREFERRED_FREE_MODELS.iter().map(|m| (*m).to_string()).collect(),
+    };
+    if let Some(cat) = &catalogue {
+        // Gathered first: the filter would otherwise hold an immutable borrow on
+        // `candidates` across the push that mutates it.
+        let extra: Vec<String> = cat
+            .iter()
+            .filter(|c| !candidates.iter().any(|k| k == *c))
+            .cloned()
+            .collect();
+        candidates.extend(extra);
+    }
+    let probe_limit = PREFERRED_FREE_MODELS.len();
+    let mut tried = 0usize;
+    let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    let winner = pick_usable(&refs, |m| {
+        tried += 1;
+        if tried > probe_limit {
+            // Past the shortlist, stop probing and just take it.
+            return false;
+        }
+        let ok = serves(api_key, m);
+        if !ok {
+            eprintln!("  {m} did not answer; trying the next free model");
+        }
+        ok
+    });
+    match winner {
+        Some(m) => m.to_string(),
         None => {
             eprintln!(
-                "warning: could not reach OpenRouter's model list, using {DEFAULT_MODEL} \
-                 unverified. Override with --exec-model if it is rejected."
+                "warning: no preferred free model answered; using {DEFAULT_MODEL} unverified.                  Name one with --exec-model if it is rejected."
             );
             DEFAULT_MODEL.to_string()
         }
@@ -180,21 +252,39 @@ pub fn api_key() -> Result<String> {
     )
 }
 
+/// Refuse anything that is not a free-tier model.
+///
+/// The premise of this command is that the executor costs nothing, and the
+/// account it was first run against is *not* flagged `is_free_tier`, so nothing
+/// on OpenRouter's side would stop a paid model: a mistyped `--exec-model` or a
+/// dropped `:free` suffix would bill real money mid-task, silently, in a loop.
+/// Enforcing the suffix here is the only thing between that typo and a charge.
+fn require_free(model: &str) -> Result<()> {
+    if model.ends_with(":free") {
+        return Ok(());
+    }
+    bail!(
+        "refusing to run `{model}`: it is not a free-tier model. This tool only executes on          models whose id ends in `:free`, and `{model}` does not. Drop --exec-model to have one          resolved from OpenRouter's live free catalogue, or name a :free model explicitly."
+    )
+}
+
 impl Client {
     pub fn new(model: Option<String>, timeout_secs: u64) -> Result<Self> {
         let explicit = model
             .filter(|m| !m.trim().is_empty())
             .or_else(|| std::env::var("OPENROUTER_MODEL").ok())
             .filter(|m| !m.trim().is_empty());
+        // A paid model is refused before any network call at all.
+        if let Some(m) = &explicit {
+            require_free(m)?;
+        }
+        let api_key = api_key()?;
         let model = match explicit {
             Some(m) => m,
-            None => resolve_model(),
+            None => resolve_model(&api_key),
         };
-        Ok(Client {
-            api_key: api_key()?,
-            model,
-            timeout_secs,
-        })
+        require_free(&model)?;
+        Ok(Client { api_key, model, timeout_secs })
     }
 
     /// One completion. Appends the reply to `history` so the caller's context
@@ -581,14 +671,24 @@ mod tests {
 
     #[test]
     fn a_missing_key_explains_how_to_get_one() {
-        // Env is process-wide, so this only asserts the message shape when no key
-        // is configured anywhere -- which is the state of a fresh checkout.
-        if std::env::var("OPENROUTER_API_KEY").is_ok() {
+        // Both sources must be empty for this to mean anything: `api_key()` reads
+        // the env var AND ~/.chatgpt-use/openrouter.key, so on a configured
+        // machine there is no "missing key" to assert about.
+        //
+        // It also must not use unwrap_err(): the success value is the key itself,
+        // and a panic on it would print a secret into the test log.
+        if std::env::var("OPENROUTER_API_KEY").is_ok() || key_path().is_some_and(|p| p.exists()) {
+            eprintln!("an OpenRouter key is configured; nothing to assert");
             return;
         }
-        let err = api_key().unwrap_err().to_string();
-        assert!(err.contains("openrouter.ai/keys"), "{err}");
-        assert!(err.contains("OPENROUTER_API_KEY"), "{err}");
+        match api_key() {
+            Ok(_) => panic!("api_key() succeeded with no key configured"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("openrouter.ai/keys"), "{msg}");
+                assert!(msg.contains("OPENROUTER_API_KEY"), "{msg}");
+            }
+        }
     }
 
     /// Real network, so it is `#[ignore]`d: the suite must stay offline, per
@@ -617,6 +717,67 @@ mod tests {
     }
 
     #[test]
+    fn a_paid_model_is_refused_before_anything_is_spent() {
+        // The guard is about money, so both shapes of mistake matter: the suffix
+        // missing entirely, and the suffix right but the case wrong.
+        assert!(require_free("meta-llama/llama-3.3-70b-instruct").is_err());
+        assert!(require_free("openai/gpt-4o").is_err());
+        assert!(require_free("anthropic/claude-sonnet-4:free").is_ok());
+        assert!(require_free("qwen/qwen3.8-27b:free").is_ok());
+        let msg = require_free("openai/gpt-4o").unwrap_err().to_string();
+        assert!(msg.contains("not a free-tier model"), "{msg}");
+    }
+
+    /// The load-bearing assumption of the whole two-tier design: a cheap model
+    /// will emit the rigid one-line tool-call JSON. If it cannot, `delegate` does
+    /// not work at any price, so this earns a real (free) call rather than an
+    /// assumption.
+    ///
+    /// Uses `complete` only, never `run_chunk` -- that would execute whatever
+    /// tools the model asked for and let a test touch the disk.
+    #[test]
+    #[ignore]
+    fn a_free_model_actually_follows_the_tool_protocol() {
+        let client = Client::new(None, 120).expect("a key and a free model");
+        let specs = crate::tools::builtin_specs();
+        let chunk = Chunk {
+            index: 0,
+            steps: vec![crate::delegation::PlanStep {
+                step: 1,
+                action: "list the files in the current directory".into(),
+                target: ".".into(),
+                success_criteria: "a listing is shown".into(),
+            }],
+        };
+        let mut history = chunk_messages(&specs, "probe the executor path", &[], &[], &chunk, &[]);
+        let reply = client.complete(&mut history).expect("one free completion");
+        eprintln!("MODEL {}\nREPLY {}", client.model, reply);
+        match protocol::parse_reply(&reply) {
+            Reply::Tools(calls) => {
+                assert!(!calls.is_empty(), "a tool-call reply with no calls in it");
+                let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
+                eprintln!("PARSED {:?} as the first turn", names);
+            }
+            Reply::Text(t) => panic!(
+                "the free model answered in prose instead of calling a tool, so the text \
+                 protocol it is being driven by does not hold at this tier. Reply was: {}",
+                t.chars().take(400).collect::<String>()
+            ),
+        }
+    }
+
+    #[test]
+    fn pick_usable_skips_models_that_do_not_answer() {
+        // The real probe makes a completion; this one is a set. What is under test
+        // is the selection order and the give-up behaviour, not the network.
+        let usable = std::collections::HashSet::from(["b"]);
+        let got = pick_usable(&["a", "b", "c"], |m| usable.contains(m));
+        assert_eq!(got, Some("b"), "must take the first answering model, not the first listed");
+        assert_eq!(pick_usable(&["a", "c"], |_| false), None, "none answering is None");
+        assert_eq!(pick_usable(&[], |_| true), None, "an empty shortlist cannot be probed");
+    }
+
+    #[test]
     fn every_candidate_executor_model_is_free() {
         // The whole economic premise is that the executor costs nothing. If one
         // paid model slips into the shortlist, a "free" run quietly bills.
@@ -630,20 +791,23 @@ mod tests {
     #[test]
     #[ignore]
     fn the_resolved_default_actually_exists_on_openrouter_right_now() {
-        // The failure this guards against already happened: a hardcoded default
-        // that had been retired from the free tier. Keyless and free, so it can
-        // be run on demand without touching anyone's quota.
+        // The failure this guards against already happened twice: a hardcoded
+        // default that had been retired from the free tier, and then a shortlist
+        // of models that are LISTED but do not serve. Cheap and keyless for the
+        // list; the probe costs a few output tokens of free quota.
+        let key = api_key().expect("this probe needs a configured OpenRouter key");
         let catalogue = free_models().expect("OpenRouter's model list should be reachable");
         assert!(
             catalogue.len() > 5,
             "suspiciously short catalogue: {catalogue:?}"
         );
-        let picked = resolve_model();
+        let picked = resolve_model(&key);
         assert!(
             catalogue.contains(&picked),
             "resolved {picked} is not in the catalogue"
         );
         assert!(picked.ends_with(":free"));
-        eprintln!("resolved executor model: {picked}");
+        assert!(serves(&key, &picked), "the resolver picked {picked}, which does not answer");
+        eprintln!("resolved executor model (verified serving): {picked}");
     }
 }
