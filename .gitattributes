@@ -1,0 +1,26 @@
+# Line endings are decided in the repo, not per contributing machine.
+#
+# This matters concretely for two files here. A shell script saved with CRLF
+# fails at the top of `curl ... | sh` on macOS/Linux (the `\r` lands up in
+# `set -eu\r` and in every path), and Windows PowerShell 5.1 refuses to parse a
+# here-string whose terminator is not preceded by CRLF. With core.autocrlf=true
+# on a Windows checkout - which is how this repo is developed - neither outcome
+# is reproducible without pinning them.
+
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# Never line-endings, never diff noise.
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.gz    binary
+*.zip   binary
+
+# Nothing here is a real source file with a "normal" diff; keep them explicit.
+Cargo.lock text
+*.html    text eol=lf

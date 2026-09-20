@@ -68,3 +68,53 @@ jobs:
           files: |
             ${{ steps.package.outputs.asset }}
             ${{ steps.package.outputs.asset }}.sha256
+
+  # Windows is this fork's reason for existing, and without a job here the
+  # platform ships untested: the first Windows port compiled only because
+  # nothing ever asked it to build on the platforms it broke.
+  build-windows:
+    name: x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # windows-latest ships VS with the C++ workload; assert it rather than
+      # discovering a linker problem in a 4-minute build.
+      - name: Check the MSVC linker is present
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found - no Visual Studio on this runner" }
+          $hasLl = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $hasLl) { throw "no VC++ toolchain: $(& $vswhere -latest -products * -property displayName)" }
+          Write-Host "linker from: $hasLl"
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $asset = "chatgpt-use-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/chatgpt-use.exe" -DestinationPath $asset
+          $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLower()
+          # `sha256sum`-style sidecar, matching the Unix assets so installers can
+          # parse one format: "<hex>  <filename>".
+          Set-Content -Path "$asset.sha256" -Value "$hash  $asset" -Encoding ascii -NoNewline
+          "asset=$asset" >> $env:GITHUB_OUTPUT
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256

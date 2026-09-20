@@ -3,9 +3,16 @@
 > Turn your **ChatGPT web subscription** into a coding-agent backend — **no API key, no Codex billing.**
 > Built on [`chrome-use`](https://github.com/leeguooooo/chrome-use), same lineage as [`chatgpt-imagegen`](https://github.com/leeguooooo/chatgpt-imagegen) and [`cookie-use`](https://github.com/leeguooooo/cookie-use).
 
-<p align="center"><em>🧪 Experimental · <strong>v0.0.2 released</strong>. Browser main line (ask · structured delegation · <code>--model pro</code> · handoff) is live-verified; install with the one-liner below.</em></p>
+<p align="center"><em>🧪 Experimental · <strong>v0.0.3 released</strong>. Browser main line (ask · structured delegation · <code>--model pro</code> · handoff) is live-verified; install with the one-liner below.</em></p>
 
 ![chatgpt-use](assets/hero.png)
+
+> **Fork note.** This is [`RudraNarayanP/agenticcoding-with-chatgpt`](https://github.com/RudraNarayanP/agenticcoding-with-chatgpt),
+> a fork of [`leeguooooo/chatgpt-use`](https://github.com/leeguooooo/chatgpt-use) whose added scope is
+> **Windows**: it builds, installs, finds `chrome-use` on `PATH`, runs the `bash` tool without a POSIX
+> shell, and can cancel a request without `kill`. Upstream owns the design and the macOS/Linux work;
+> "live-verified" below refers to upstream's macOS testing. See
+> [the platform caveat](#the-honest-caveats) for what this fork has and has not proven.
 
 Your Plus / Pro plan already includes a chat surface you've paid for. `chatgpt-use` drives that
 **logged-in web conversation** through `chrome-use` — exactly the way `chatgpt-imagegen` drives image
@@ -401,16 +408,51 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
   logged-in ChatGPT (esp. Pro) as a high-quality planner/reviewer in a local coding workflow; execution
   stays with Codex / Claude Code / local tools."* Stay within your plan's terms; this is a personal
   productivity bridge, not a resale/automation-at-scale tool.
-- **macOS first** (matches `chrome-use` / `cookie-use`); other platforms follow `chrome-use`.
+- **Platforms: macOS/Linux come from upstream; Windows is this fork's addition, and only half of it
+  is proven.** Verified on Windows: the offline suite passes 132/132 under *both* shell paths (a
+  Git-for-Windows `sh`, and `CHATGPT_USE_SHELL=powershell` forcing the fallback), and the same suite
+  passes 130/130 on Linux; `init`, `status` and `cancel` were each run against a live local process,
+  which is what caught the `PATH`-search and `pid_alive` bugs below. **Not** verified: no ChatGPT
+  turn has been driven through `chrome-use` on Windows, because `AGENTS.md` rightly forbids testing
+  against the live site. `chrome-use` does ship a Windows build and runs here (`1.5.125`), so the
+  dependency is sound, but whether composer typing, the model picker and conversation-record reads
+  behave identically on Windows Chrome is unchecked. Treat Windows *browser* paths as
+  expected-to-work, not proven. Say so before debugging a model, not after.
+- **Everything else is upstream's design**, including the request-economy tricks and the failure
+  semantics; this fork's scope is "make it build, install and behave on Windows without breaking
+  macOS/Linux."
 
 ---
 
 ## Install
 
-> Distribution follows the GitHub-Release route (no npm, no token). Once the first binary ships:
+> Distribution follows the GitHub-Release route (no npm, no token).
+
+**macOS / Linux**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leeguooooo/chatgpt-use/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/RudraNarayanP/agenticcoding-with-chatgpt/main/install.sh | sh
+```
+
+**Windows** — two scripts, because "install a binary" and "build + wire up the browser host" are
+different jobs:
+
+```powershell
+# From a clone, building from source and registering the chrome-use native-messaging host:
+powershell -ExecutionPolicy Bypass -File .\setup-windows.ps1
+
+# Or just the prebuilt binary (needs the first published release to exist):
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Both install into `%USERPROFILE%\.local\bin`, resolve chrome-use's *latest* release rather than a
+pinned version, and verify a `sha256sum`-style sidecar before running anything. `setup-windows.ps1`
+needs Rust 1.89+ (`winget install Rustlang.Rustup`) and any VS 2022 with the C++ workload for the
+linker. Then:
+
+```powershell
+chatgpt-use init                      # writes %USERPROFILE%\.chatgpt-use\auth.json
+.\start-work-mode.ps1 -Project C:\path\to\app
 ```
 
 `chatgpt-use` **requires `chrome-use`** on `PATH`. If it's missing:
@@ -421,6 +463,9 @@ curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.
 
 Then make sure you have a Chrome profile logged in to chatgpt.com (or connect your live Chrome via
 `chrome-use extension connect`).
+
+> `install.sh` prints the PowerShell route instead of "unsupported OS" when run from Git Bash —
+> a POSIX shell on Windows cannot place the `.exe` or the extension host where they belong.
 
 ---
 

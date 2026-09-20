@@ -1,0 +1,91 @@
+name: ci
+
+# `AGENTS.md` forbids testing against live ChatGPT, and says so for a good
+# reason: the account is throttled by request count. Everything in this workflow
+# is the offline half of that instruction - `cargo test` never launches
+# chrome-use - so it is safe to run on every push.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} ${{ matrix.shell && format('({0})', matrix.shell) || '' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,   shell: '' }
+          - { os: macos-14,        shell: '' }
+          - { os: macos-15-intel,  shell: '' }
+          # Both Windows shell paths run the same suite. The bash tool resolves
+          # to Git for Windows' sh on a GitHub runner, so without the second job
+          # the PowerShell fallback - the only path on a machine with no Git -
+          # would merge untested.
+          - { os: windows-latest,  shell: posix }
+          - { os: windows-latest,  shell: powershell }
+    env:
+      CHATGPT_USE_SHELL: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Test
+        run: cargo test
+
+  # Both of these are informational, deliberately not blocking.
+  #
+  # Measured on this tree: `cargo fmt --all --check` reports 190 hunks and
+  # `cargo clippy --all-targets` 18 warnings, and they are pre-existing - 172 of
+  # the hunks are there before any of this fork's changes, and every clippy
+  # warning is in upstream code (`channel.rs`, `cmd/*.rs`), none in the new
+  # `util.rs` / `receipt.rs`. Turning either into a hard gate would leave a
+  # permanently red badge that nobody reads, which is worse than no badge. The
+  # right sequence is a separate formatting-only commit, then flip
+  # `continue-on-error` off; the counts below are the starting point for it.
+  lint:
+    name: fmt + clippy (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Formatting drift
+        run: |
+          n=$(cargo fmt --all --check 2>&1 | grep -c '^Diff' || true)
+          echo "cargo fmt --check: $n hunks would change"
+      - name: Clippy
+        run: cargo clippy --all-targets 2>&1 | grep -c '^warning: ' | xargs -I{} echo "clippy: {} warnings"
+
+  # Guards the one class of bug that a host-only check cannot see: code under
+  # #[cfg(unix)] / #[cfg(windows)] that only compiles on the other platform.
+  cross-check:
+    name: check ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-gnu, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # `check` only, so no cross linker is needed - the point is to type-check
+      # the cfg branches of a platform the job's own OS is not.
+      - name: Type-check the foreign cfg branches
+        run: cargo check --all-targets --target ${{ matrix.target }}

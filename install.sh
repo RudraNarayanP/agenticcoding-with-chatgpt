@@ -1,10 +1,12 @@
 #!/bin/sh
 # chatgpt-use installer — downloads a prebuilt binary from GitHub Releases.
 # No npm, no token. Usage:
-#   curl -fsSL https://raw.githubusercontent.com/leeguooooo/chatgpt-use/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/RudraNarayanP/agenticcoding-with-chatgpt/main/install.sh | sh
+#
+# Windows: use install.ps1 (this script cannot put a .exe where you need it).
 set -eu
 
-REPO="leeguooooo/chatgpt-use"
+REPO="RudraNarayanP/agenticcoding-with-chatgpt"
 BIN="chatgpt-use"
 INSTALL_DIR="${CHATGPT_USE_INSTALL_DIR:-$HOME/.local/bin}"
 
@@ -25,6 +27,18 @@ case "$os" in
             aarch64|arm64) target="aarch64-unknown-linux-gnu" ;;
             *) die "unsupported Linux arch: $arch" ;;
           esac ;;
+  MINGW*|MSYS*|CYGWIN*)
+    # Reaching here means a POSIX shell on Windows - Git Bash, usually. The
+    # binaries and the browser extension this tool needs are Windows-side, so
+    # point at the installer that can actually place them instead of dying with
+    # "unsupported OS: MINGW64_NT", which read as though Windows were unhandled.
+    say "This is a POSIX shell on Windows ($os). chatgpt-use installs there via PowerShell:"
+    say ""
+    say "  powershell -ExecutionPolicy Bypass -File .\\install.ps1"
+    say ""
+    say "or, from a fresh terminal:"
+    say "  iwr -useb https://raw.githubusercontent.com/$REPO/main/install.ps1 | iex"
+    exit 1 ;;
   *) die "unsupported OS: $os (build from source: cargo install --git https://github.com/$REPO)" ;;
 esac
 
