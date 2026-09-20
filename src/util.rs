@@ -4,9 +4,10 @@
 //! user's home directory is, and how to get random bytes. Both are answered
 //! here once so no caller has to carry a `#[cfg]` branch.
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// User home directory (`HOME` on Unix, `USERPROFILE` on Windows).
 ///
@@ -146,9 +147,140 @@ pub fn candidate_paths(dir: &std::path::Path, program: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Read `pipe` to EOF on a worker thread and hand the bytes to `tx`. Generic over
+/// the pipe type because stdout and stderr are distinct types.
+fn drain<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+) {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
+        }
+        // try_send: the receiver may already have given up on its bounded join.
+        let _ = tx.try_send(buf);
+    });
+}
+
+/// Run `cmd` to completion, capturing its streams, but never for longer than
+/// `timeout_secs`.
+///
+/// This exists because `Command::output()` blocks until the child exits, and the
+/// chrome-use transport took a timeout argument and ignored it. Every call site
+/// passes a budget, so `--timeout` looked like it governed a run while a single
+/// wedged chrome-use call actually held the process forever -- a hang no deadline
+/// inside the caller can interrupt.
+///
+/// The streams are drained on reader threads rather than by `output()` so a
+/// chatty child cannot deadlock on a full pipe while we wait to notice it
+/// finished. The joins are bounded too, on purpose: `chrome-use` hands work to
+/// long-lived session daemons, and a daemon that inherits a pipe handle can keep
+/// it open after its client exits, which would otherwise turn a hang we removed
+/// back into a hang we reintroduced. A caller that waits for output it never gets
+/// is worse off than one that waits briefly and reports what it has.
+pub fn run_bounded(cmd: &mut Command, timeout_secs: f64) -> Result<std::process::Output> {
+    let budget = Duration::try_from_secs_f64(timeout_secs.max(1.0))
+        .unwrap_or_else(|_| Duration::from_secs(1));
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning {}", cmd.get_program().to_string_lossy()))?;
+
+    let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    let (err_tx, err_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    drain(child.stdout.take(), out_tx);
+    drain(child.stderr.take(), err_tx);
+
+    let deadline = Instant::now() + budget;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!(
+                        "timed out after {}s (the process was stopped; it may have been wedged)",
+                        budget.as_secs_f64()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e).context("waiting for the child process"),
+        }
+    };
+
+    // Bounded join, per the note above. 2s is far past any real drain of a
+    // finished child and still keeps us off the hang path.
+    let wait = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+        rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default()
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: wait(out_rx),
+        stderr: wait(err_rx),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_bounded_stops_a_hung_child_instead_of_waiting_for_it() {
+        // The bug this retires: `Command::output()` waits forever, so a wedged
+        // chrome-use call held chatgpt-use indefinitely and `--timeout` never
+        // fired. A child that sleeps far past the budget must produce an error,
+        // quickly, and must not be left running.
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("powershell");
+            c.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ]);
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        let start = Instant::now();
+        let err = run_bounded(&mut cmd, 1.0).expect_err("a 30s child must not finish in 1s");
+        let elapsed = start.elapsed();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "took {elapsed:?} to give up"
+        );
+    }
+
+    #[test]
+    fn run_bounded_returns_exit_status_and_output() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "echo bounded-ok && exit 7"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "echo bounded-ok; exit 7"]);
+            c
+        };
+        let out = run_bounded(&mut cmd, 30.0).unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(7),
+            "the child's exit code must survive"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("bounded-ok"),
+            "stdout must survive the reader threads"
+        );
+    }
 
     #[test]
     fn random_bytes_are_random_and_the_right_length() {

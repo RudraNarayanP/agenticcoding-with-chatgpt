@@ -2850,7 +2850,7 @@ fn ab_cmd_with_profile(
     args: &[&str],
     session: &str,
     profile: Option<&str>,
-    _timeout_secs: f64,
+    timeout_secs: f64,
 ) -> Result<String> {
     let mut cmd = crate::util::command_at(ab);
     if let Some(prof) = profile {
@@ -2859,8 +2859,10 @@ fn ab_cmd_with_profile(
     cmd.args(args);
     cmd.args(["--session", session]);
 
-    let output = cmd
-        .output()
+    // `run_bounded`, not `cmd.output()`: output() blocks until the child exits,
+    // so the budget every caller passes here was accepted and discarded, and one
+    // wedged chrome-use call held the whole process forever.
+    let output = crate::util::run_bounded(&mut cmd, timeout_secs)
         .with_context(|| format!("failed to run chrome-use {args:?}"))?;
 
     if !output.status.success() {
@@ -2880,11 +2882,13 @@ fn ab_cmd_with_profile(
         } else {
             tail
         };
+        // `chars`, not a byte slice: chrome-use writes browser text, so a 300-byte
+        // cut can land mid-codepoint and panic the process on an emoji.
         bail!(
             "chrome-use {:?} failed (exit {}): {}",
             args,
             output.status.code().unwrap_or(-1),
-            &detail[..detail.len().min(300)]
+            detail.chars().take(300).collect::<String>()
         );
     }
 
