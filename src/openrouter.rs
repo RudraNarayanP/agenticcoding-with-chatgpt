@@ -252,6 +252,25 @@ pub fn api_key() -> Result<String> {
     )
 }
 
+/// Whether an OpenRouter failure is worth retrying.
+///
+/// Free tiers sit behind independent upstream providers that routinely answer
+/// "temporarily overloaded" or a rate limit, and a chunk that already wrote its
+/// file must not be reported as failed because the *next* turn hit one of those.
+/// Measured directly: nemotron wrote note.txt correctly and then died on
+/// "Upstream error from Nvidia: Service temporarily overloaded".
+/// A refusal naming the model or the key is never transient, so retrying it would
+/// only waste the caller's time.
+fn is_transient(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    [
+        "overload", "temporarily", "try again", "rate limit", "ratelimit", "429", "500", "502",
+        "503", "504", "upstream", "timeout", "timed out", "reset", "unavailable", "busy",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
+}
+
 /// Refuse anything that is not a free-tier model.
 ///
 /// The premise of this command is that the executor costs nothing, and the
@@ -287,13 +306,48 @@ impl Client {
         Ok(Client { api_key, model, timeout_secs })
     }
 
+    /// One completion, retrying transient upstream failures.
+    ///
+    /// Safe to retry because a failed attempt never touches `history`, so the
+    /// conversation cannot gain a duplicated or half-written turn.
+    pub fn complete_retrying(&self, history: &mut Vec<Message>, attempts: u32) -> Result<String> {
+        let mut last = String::new();
+        for try_no in 1..=attempts.max(1) {
+            match self.complete(history) {
+                Ok(reply) => return Ok(reply),
+                Err(e) => {
+                    last = format!("{e:#}");
+                    if !is_transient(&last) || try_no == attempts {
+                        break;
+                    }
+                    // Free providers recover in seconds, not minutes.
+                    let back = 4 * try_no;
+                    eprintln!("  transient upstream failure ({}); retrying in {back}s", last.chars().take(90).collect::<String>());
+                    std::thread::sleep(std::time::Duration::from_secs(back as u64));
+                }
+            }
+        }
+        bail!(last)
+    }
+
     /// One completion. Appends the reply to `history` so the caller's context
     /// grows the way an agent loop needs it to.
+    ///
+    /// Empty content is an error rather than an empty string: it is what a model
+    /// that exhausted its token budget on hidden reasoning returns, and a loop
+    /// that treats it as "the model said nothing, so it must be finished" will
+    /// report success having done nothing.
     pub fn complete(&self, history: &mut Vec<Message>) -> Result<String> {
         let body = self.request_body(history);
         let text = self.post(&body)?;
         let reply = parse_completion(&text)
             .with_context(|| format!("parsing OpenRouter response (model {})", self.model))?;
+        if reply.trim().is_empty() {
+            bail!(
+                "{} returned no content. Free reasoning models sometimes spend the whole                  token budget thinking; try --exec-model with a non-reasoning model.",
+                self.model
+            );
+        }
         history.push(Message::assistant(reply.clone()));
         Ok(reply)
     }
@@ -307,7 +361,10 @@ impl Client {
             // The protocol is text, so temperature is load-bearing: 0.2 keeps a
             // cheap model literal about file contents instead of "improving" them.
             "temperature": 0.2,
-            "max_tokens": 4096,
+            // 8k, not 4k: several free models reason before they emit, and a
+            // budget consumed entirely by hidden reasoning comes back as empty
+            // content -- which `run_chunk` now treats as the failure it is.
+            "max_tokens": 8192,
         })
     }
 
@@ -486,6 +543,24 @@ pub fn chunk_messages(
     ]
 }
 
+/// Decide whether a chunk may call itself finished. Pure, so the rule is tested
+/// without a model.
+///
+/// A chunk of plan steps cannot be satisfied without at least one tool call.
+/// Accepting prose as "finished" is what let a real run report CONTINUE chunk
+/// after chunk while writing no files at all, so an empty-handed chunk must be an
+/// error the planner hears about rather than a success.
+fn finish_chunk(tools_seen: u32, line: &str) -> Result<()> {
+    if tools_seen == 0 {
+        bail!(
+            "the executor called no tools at all and is claiming to be done. Its words              were: {}
+This is usually a model that spent its token budget reasoning              instead of acting -- retry with --exec-model naming a non-reasoning free              model, or raise --exec-timeout.",
+            if line.trim().is_empty() { "(empty reply)" } else { line.trim() }
+        );
+    }
+    Ok(())
+}
+
 /// Run one chunk to completion: ask, parse, execute tools, feed back, repeat.
 ///
 /// Returns the executor's final `DONE:` line. `max_turns` bounds the loop; a
@@ -499,7 +574,8 @@ pub fn run_chunk(
     perm: crate::cli::PermissionMode,
 ) -> Result<String> {
     let mut history = seed;
-    let mut reply = client.complete(&mut history)?;
+    let mut reply = client.complete_retrying(&mut history, 3)?;
+    let mut tools_seen: u32 = 0;
 
     // Cheap models sometimes open with prose. Unlike the browser channel there is
     // no human to nudge, so ask once, mechanically, in the same shape.
@@ -509,13 +585,14 @@ pub fn run_chunk(
              {\"tool_calls\":[{\"id\":\"call_0\",\"name\":\"list_dir\",\"input\":{\"path\":\".\"}}]} \
              and then continue the task with one such line per tool call.",
         ));
-        reply = client.complete(&mut history)?;
+        reply = client.complete_retrying(&mut history, 3)?;
     }
 
     for turn in 1..=max_turns {
         match protocol::parse_reply(&reply) {
             Reply::Text(final_line) => {
                 let line = final_line.trim().to_string();
+                finish_chunk(tools_seen, &line)?;
                 if !line.to_uppercase().starts_with("DONE") {
                     eprintln!(
                         "[chunk] executor stopped without a DONE line; last words: {}",
@@ -525,6 +602,7 @@ pub fn run_chunk(
                 return Ok(line);
             }
             Reply::Tools(calls) => {
+                tools_seen += calls.len() as u32;
                 for call in &calls {
                     eprintln!("[chunk turn {turn}] tool: {}", call.name);
                 }
@@ -532,7 +610,7 @@ pub fn run_chunk(
                     calls.iter().map(|c| tools_execute(c, cwd, perm)).collect();
                 let observation = protocol::render_results(&results);
                 history.push(Message::user(observation));
-                reply = client.complete(&mut history)?;
+                reply = client.complete_retrying(&mut history, 3)?;
             }
         }
     }
@@ -767,6 +845,30 @@ mod tests {
     }
 
     #[test]
+    fn only_failures_that_can_recover_are_retried() {
+        assert!(is_transient("Upstream error from Nvidia: Service temporarily overloaded"));
+        assert!(is_transient("Rate limit exceeded, please try again"));
+        assert!(is_transient("Provider returned 503"));
+        // Retrying these would just delay the real answer.
+        assert!(!is_transient("refusing to run gpt-4o: it is not a free-tier model"));
+        assert!(!is_transient("User not found."));
+        assert!(!is_transient("Invalid key"));
+    }
+
+    #[test]
+    fn a_chunk_that_touched_nothing_is_never_finished() {
+        // The exact failure a live `delegate` run produced: three chunks reported
+        // success, zero files existed on disk.
+        assert!(finish_chunk(0, "DONE: everything works").is_err());
+        assert!(finish_chunk(0, "").is_err());
+        let msg = finish_chunk(0, "I have completed the task").unwrap_err().to_string();
+        assert!(msg.contains("called no tools"), "{msg}");
+        assert!(msg.contains("--exec-model"), "must say what to do about it: {msg}");
+        // Once it has acted, a claim of completion is the planner's problem, not ours.
+        assert!(finish_chunk(3, "DONE: ran cargo test, 12 passed").is_ok());
+    }
+
+    #[test]
     fn pick_usable_skips_models_that_do_not_answer() {
         // The real probe makes a completion; this one is a set. What is under test
         // is the selection order and the give-up behaviour, not the network.
@@ -775,6 +877,53 @@ mod tests {
         assert_eq!(got, Some("b"), "must take the first answering model, not the first listed");
         assert_eq!(pick_usable(&["a", "c"], |_| false), None, "none answering is None");
         assert_eq!(pick_usable(&[], |_| true), None, "an empty shortlist cannot be probed");
+    }
+
+    /// The claim the whole command rests on: a free model, given one plan step,
+    /// produces a real file on disk. Zero chatgpt.com requests -- it exercises
+    /// tier 2 alone. Costs a few free completions, so it is #[ignore]d.
+    #[test]
+    #[ignore]
+    fn the_free_executor_really_writes_a_file() {
+        let dir = std::env::temp_dir().join(format!("cgu-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Named, not resolved: reasoning models were shown to spend the budget and
+        // emit nothing, which is the failure under test, not the thing to select.
+        let client = Client {
+            api_key: api_key().expect("a configured key"),
+            model: "nvidia/nemotron-3-super-120b-a12b:free".into(),
+            timeout_secs: 150,
+        };
+        let specs = crate::tools::builtin_specs();
+        let chunk = Chunk {
+            index: 0,
+            steps: vec![crate::delegation::PlanStep {
+                step: 1,
+                action: "write a file named note.txt containing exactly the text HELLO-FROM-EXECUTOR".into(),
+                target: "note.txt".into(),
+                success_criteria: "note.txt exists and contains HELLO-FROM-EXECUTOR".into(),
+            }],
+        };
+        let seed = chunk_messages(
+            &specs,
+            "produce note.txt",
+            &["note.txt exists and contains HELLO-FROM-EXECUTOR".into()],
+            &["do not create any other file".into()],
+            &chunk,
+            &[],
+        );
+        let outcome = run_chunk(&client, seed, &dir, 8, crate::cli::PermissionMode::Trusted);
+        let written = std::fs::read_to_string(dir.join("note.txt")).unwrap_or_default();
+        let listing: Vec<String> = std::fs::read_dir(&dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        eprintln!("OUTCOME  {outcome:?}
+note.txt {written:?}
+dir {listing:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome.expect("the chunk should finish");
+        assert!(written.contains("HELLO-FROM-EXECUTOR"), "the file must actually be written: {written:?}");
+        assert!(listing.iter().any(|f| f == "note.txt"));
     }
 
     #[test]
