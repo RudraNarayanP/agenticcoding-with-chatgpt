@@ -17,6 +17,7 @@ mod receipt; // ask --request-id: durable per-request receipts
 mod protocol; // tool-call text protocol: types, system prompt, parsing, rendering
 mod structured; // ask --output-schema: validate a reply against a caller's JSON Schema
 mod tools; // local tool executor (read_file / write_file / bash / grep / list_dir)
+mod util; // cross-platform home dir + random bytes
 
 use clap::Parser;
 use cli::{Cli, Command};

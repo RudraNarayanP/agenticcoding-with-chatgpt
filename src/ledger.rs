@@ -16,10 +16,9 @@ pub fn record(kind: &str, data: Value) {
     }
 }
 
-/// `~/.chatgpt-use` (falls back to the current dir if HOME is unset).
+/// `~/.chatgpt-use` (falls back to the current dir if home is unset).
 pub(crate) fn ledger_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+    crate::util::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".chatgpt-use")
 }

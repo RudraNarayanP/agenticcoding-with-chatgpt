@@ -4,15 +4,14 @@
 //! `mcp` command auto-loads this token when `--token` is omitted.
 
 use crate::cli::InitArgs;
+use crate::util;
 use anyhow::{Context, Result};
-use std::io::Read;
 
 /// The config directory: `~/.chatgpt-use`.
 pub fn config_dir() -> std::path::PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    home.join(".chatgpt-use")
+    util::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".chatgpt-use")
 }
 
 /// Path to the auth file: `~/.chatgpt-use/auth.json`.
@@ -29,11 +28,9 @@ pub fn load_token() -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// 16 random bytes from /dev/urandom, hex-encoded (no RNG crate needed).
+/// 16 random bytes, hex-encoded (no RNG crate needed).
 fn random_token() -> Result<String> {
-    let mut f = std::fs::File::open("/dev/urandom").context("opening /dev/urandom")?;
-    let mut buf = [0u8; 16];
-    f.read_exact(&mut buf).context("reading random bytes")?;
+    let buf = util::random_bytes(16)?;
     let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
     Ok(format!("cgu-{hex}"))
 }

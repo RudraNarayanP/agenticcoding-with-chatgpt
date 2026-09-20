@@ -9,10 +9,10 @@
 //! State is held in a `static Mutex<OauthState>` (initialized via `OnceLock`).
 //! All issued codes / tokens are in-process; they do not survive a server restart.
 
+use crate::util;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::Read;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -52,15 +52,12 @@ fn state() -> &'static Mutex<OauthState> {
 }
 
 // ---------------------------------------------------------------------------
-// Random helpers (no RNG crate — /dev/urandom only)
+// Random helpers (no RNG crate — platform CSPRNG via util)
 // ---------------------------------------------------------------------------
 
-/// Read `n` random bytes from /dev/urandom and return them.
+/// Read `n` random bytes and return them.
 fn random_bytes(n: usize) -> Vec<u8> {
-    let mut f = std::fs::File::open("/dev/urandom").expect("/dev/urandom must be available");
-    let mut buf = vec![0u8; n];
-    f.read_exact(&mut buf).expect("reading /dev/urandom");
-    buf
+    util::random_bytes(n).expect("random bytes must be available")
 }
 
 /// Generate a random URL-safe-base64 (no-pad) token from `n` raw bytes.

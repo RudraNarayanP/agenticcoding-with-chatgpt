@@ -2660,8 +2660,7 @@ fn composer_fingerprint(text: &str) -> (u64, u32) {
 /// Against a throttle that counts requests, that is worth caching. Purely an
 /// optimisation: any read or write failure just means we resolve the slow way.
 fn project_cache_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".chatgpt-use").join("projects.json"))
+    crate::util::home_dir().map(|h| h.join(".chatgpt-use").join("projects.json"))
 }
 
 fn read_project_cache() -> serde_json::Map<String, serde_json::Value> {
@@ -2731,7 +2730,7 @@ fn holder_label(contents: &str) -> String {
 /// names mean no mutual exclusion at all — which is exactly the state that let
 /// two prompts land in one composer.
 fn lock_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".chatgpt-web.lock"))
+    crate::util::home_dir().map(|h| h.join(".chatgpt-web.lock"))
 }
 
 /// Decide whether the tab has drifted off the pinned conversation.
@@ -2762,13 +2761,20 @@ fn find_chrome_use() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    // Also check ~/.local/bin — common for manual installs on macOS/Linux.
-    if let Some(home) = std::env::var_os("HOME") {
-        let local_bin = PathBuf::from(home).join(".local").join("bin");
+    // Also check ~/.local/bin — common for manual installs.
+    if let Some(home) = crate::util::home_dir() {
+        let local_bin = home.join(".local").join("bin");
         for name in AB_BIN_CANDIDATES {
             let candidate = local_bin.join(name);
             if candidate.is_file() {
                 return Some(candidate);
+            }
+            #[cfg(windows)]
+            {
+                let candidate = local_bin.join(format!("{name}.exe"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
             }
         }
     }
