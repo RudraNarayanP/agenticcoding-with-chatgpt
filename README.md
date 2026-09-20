@@ -268,6 +268,14 @@ bearer token is fetched once per five minutes rather than per call, and a projec
 in `~/.chatgpt-use/projects.json` rather than re-listing every project each run. Per-invocation cost
 went from roughly 90 requests to single digits.
 
+**Budget the first run deliberately.** Every saving above is a cache, so the *first* run on a machine
+pays the cold costs: a full navigation plus a project-list pass to resolve `--project` (which defaults
+to `chatgpt-use`, not to nothing). `--timeout` is the budget for **one model turn** — default 300s —
+and does not cover connecting, so wrap the process in more than that or you will kill a run that was
+still inside its own budget. For a deliberate one-off smoke test, pass `--project ""` to skip the
+project pass entirely, and `--request-id <id>` so a receipt records how far it got — `chatgpt-use
+status <id>` then answers offline, without spending another request to find out whether it worked.
+
 ---
 
 ## Target architecture: dual-channel by model tier
@@ -408,16 +416,18 @@ This is a clever hack on a surface that was never meant to be an API. We're upfr
   logged-in ChatGPT (esp. Pro) as a high-quality planner/reviewer in a local coding workflow; execution
   stays with Codex / Claude Code / local tools."* Stay within your plan's terms; this is a personal
   productivity bridge, not a resale/automation-at-scale tool.
-- **Platforms: macOS/Linux come from upstream; Windows is this fork's addition, and only half of it
-  is proven.** Verified on Windows: the offline suite passes 132/132 under *both* shell paths (a
-  Git-for-Windows `sh`, and `CHATGPT_USE_SHELL=powershell` forcing the fallback), and the same suite
-  passes 130/130 on Linux; `init`, `status` and `cancel` were each run against a live local process,
-  which is what caught the `PATH`-search and `pid_alive` bugs below. **Not** verified: no ChatGPT
-  turn has been driven through `chrome-use` on Windows, because `AGENTS.md` rightly forbids testing
-  against the live site. `chrome-use` does ship a Windows build and runs here (`1.5.125`), so the
-  dependency is sound, but whether composer typing, the model picker and conversation-record reads
-  behave identically on Windows Chrome is unchecked. Treat Windows *browser* paths as
-  expected-to-work, not proven. Say so before debugging a model, not after.
+- **Platforms: macOS/Linux come from upstream; Windows is this fork's addition.** The Windows
+  browser path is now **verified live**: `chatgpt-use ask` on Windows completed a real turn in 24s
+  against a logged-in profile and recorded `state=completed, submitted=yes` with a genuine
+  conversation id. Getting there needed two fixes that are worth naming, because both were silent:
+  the default `auto` profile tried chrome-use's bare relay first, which on Windows creates the tab,
+  loads it, and then hangs on every command against it; and the tab-reuse probe ran over that bare
+  relay *before* any profile was chosen, which is fatal because chrome-use binds a session's daemon
+  to whichever command starts it and ignores `--profile` after that. So the probe reported success,
+  `connect` declared the relay usable, and the run died later at the composer with "the message was
+  never submitted". Verified offline too: 132/132 tests on Windows under *both* bash-tool shell
+  paths, 130/130 on Linux, and `init`/`status`/`cancel` each exercised against a live local process.
+  What remains unverified is only the long tail — multi-turn `run`/`work` loops on Windows.
 - **Everything else is upstream's design**, including the request-economy tricks and the failure
   semantics; this fork's scope is "make it build, install and behave on Windows without breaking
   macOS/Linux."
