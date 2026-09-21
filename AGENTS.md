@@ -34,11 +34,22 @@ not reachable. Anything that touches the user's browser still must not be run, p
   PowerShell when not, and those are different code paths. `cargo test`, then
   `CHATGPT_USE_SHELL=powershell cargo test`. On a machine with Git for Windows the second one is the
   only way the fallback gets exercised.
-- **Fresh binaries under `Desktop` are blocked here** by an application-control policy:
-  `An Application Control policy has blocked this file (os error 4551)`, and `./target/debug/*.exe`
-  then answers "Permission denied". Build with `CARGO_TARGET_DIR` pointed somewhere outside
-  `Desktop` (e.g. `C:\Users\<you>\cgu-build`) and the same binaries run fine. Do not conclude a
-  binary is broken when the loader refused it.
+- **Fresh binaries are blocked by an application-control policy, and it is not limited to
+  `Desktop`.** The symptom is `An Application Control policy has blocked this file (os error 4551)`
+  from cargo, or `Permission denied` when you exec `./target/debug/*.exe` yourself. Pointing
+  `CARGO_TARGET_DIR` somewhere else (e.g. `C:\Users\<you>\cgu-build`) used to be enough; on
+  2026-09-21 it stopped being true mid-session -- the policy began refusing a freshly built test
+  binary *and* a dependency's build script in brand-new target dirs, while a binary built and run
+  earlier the same hour still executed. It keys on the file's hash, not its path, so copying a
+  refused exe into a directory whose other exes run fine (`~/.local/bin`) does not help either.
+  Two things follow. Do not conclude a binary is broken when the loader refused it. And when the
+  suite cannot execute, say so as a limitation -- `cargo build --release` plus `cargo test --no-run`
+  proves it compiles and links and proves nothing about the 160-odd assertions.
+- **The OpenRouter tests are the cheap path for executor work.** `cargo test -- --ignored
+  openrouter::` talks to openrouter.ai and never to chatgpt.com, so it spends no requests on the
+  account this file exists to protect. `CGU_TEST_MODEL=<model>:free` points the end-to-end
+  "does this model actually write a file" test at any free model. A live `delegate` run costs
+  several ChatGPT turns; exhaust what can be learned this way first.
 - **`core.autocrlf=true` on this machine**, so the working tree is CRLF while blobs are LF. That is
   why `.gitattributes` exists: a CRLF `install.sh` breaks `curl | sh` on Unix, and Windows PowerShell
   5.1 will not parse a here-string unless its terminator is CRLF. Prefer plain `Write-Host` lines in

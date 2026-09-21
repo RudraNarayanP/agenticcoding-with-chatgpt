@@ -187,9 +187,19 @@ per chunk is what lets a fifty-tool-call task finish instead of rotting. The pla
 chatter — only one-line outcomes — which is also what keeps each check-in to a single cheap turn
 rather than a ~45-request page load.
 
+A chunk is bounded by steps for a second reason: it has to fit in **one reply**. The executor's
+request sends `"reasoning": {"effort": "none"}`, because a free thinking model will otherwise spend
+the entire token budget on hidden reasoning and return no content at all — measured on
+`cohere/north-mini-code:free` asked to write a calculator: `31,407` characters of thinking and zero
+output by default, versus 6,009 characters of valid tool-call JSON in 1,442 tokens with thinking off.
+It's cheaper on every model checked (nemotron-ultra 4,649 → 2,131 completion tokens), which is the
+whole point: ChatGPT does the reasoning, the free model only types. Raise `--chunk-steps` and the
+same budget becomes the thing that stops you — at 6 steps a run wrote both files correctly and then
+had its verification command cut off mid-tool-call.
+
 ```bash
 --exec-model <id>     default: resolved live from OpenRouter's catalogue, free-tier only
---chunk-steps N       plan steps per executor session (default 3)
+--chunk-steps N       plan steps per executor session (default 3; raising it risks a truncated reply)
 --executor-turns N    tool-call turns per chunk before it is reported unfinished (default 25)
 --dry-run             plan and show the chunking; no executor calls, no edits
 --permission-mode …   safe|trusted|dangerous, gating the executor's bash (default trusted)

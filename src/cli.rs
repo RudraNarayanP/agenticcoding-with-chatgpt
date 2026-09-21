@@ -223,6 +223,9 @@ pub struct DelegateArgs {
     pub cwd: Option<String>,
     /// Plan steps per executor session. Each chunk gets a fresh OpenRouter
     /// context, so this is the knob that bounds context rot on a long task.
+    /// Keep it low: a chunk is also what has to fit in one reply, and at 6 steps
+    /// a free model writing a calculator plus a verification script ran out of
+    /// the 8k token budget mid tool-call and came back truncated.
     #[arg(long, default_value_t = 3)]
     pub chunk_steps: usize,
     /// Tool-call turns allowed inside one chunk before it is reported as
