@@ -205,6 +205,18 @@ pub fn remember_verified(model: &str) {
     }
 }
 
+/// Forget the remembered pick.
+///
+/// The cache is a liveness hint, not a capability proof: `serves()` asks a model
+/// to emit "ok" in 64 tokens, and a model can pass that and refuse the actual
+/// task. When a chunk fails on the cached model, the next run should re-probe
+/// from the catalogue instead of walking straight back into the same refusal.
+pub fn forget_verified() {
+    if let Some(path) = verified_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Order the live free-tier list by fitness, then recency of proof.
 ///
 /// `known_good` (the shortlist) is kept ahead of the rank, and `verified` ahead
@@ -667,6 +679,25 @@ This is usually a model that spent its token budget reasoning              inste
     Ok(())
 }
 
+/// Did the executor hand off with the signal the prompt promises (`chunk_messages`
+/// asks for "a single short line starting with DONE:")?
+///
+/// Checked line by line, and only at the start of a line, because the alternative
+/// - `reply.to_uppercase().contains("DONE")` - accepts a refusal. The live
+/// failure this closes: a chunk that ran one `list_dir` and then returned prose
+/// was reported as a finished chunk, the planner said CONTINUE, and the run only
+/// admitted it had produced nothing at the final review, three minutes later.
+fn has_done_line(reply: &str) -> bool {
+    reply.lines().any(|l| {
+        // Strip the markup a model likes to wrap the signal in: `**DONE:**`,
+        // "`DONE:`", "- DONE:".
+        let t = l.trim();
+        let t = t.trim_start_matches(['*', '`', '#', '>', '-', ' ']);
+        let up = t.to_ascii_uppercase();
+        up == "DONE" || up.starts_with("DONE:") || up.starts_with("DONE ")
+    })
+}
+
 /// Run one chunk to completion: ask, parse, execute tools, feed back, repeat.
 ///
 /// Returns the executor's final `DONE:` line. `max_turns` bounds the loop; a
@@ -699,10 +730,11 @@ pub fn run_chunk(
             Reply::Text(final_line) => {
                 let line = final_line.trim().to_string();
                 finish_chunk(tools_seen, &line)?;
-                if !line.to_uppercase().starts_with("DONE") {
-                    eprintln!(
-                        "[chunk] executor stopped without a DONE line; last words: {}",
-                        line.chars().take(200).collect::<String>()
+                if !has_done_line(&line) {
+                    bail!(
+                        "the executor ended the chunk without the agreed DONE line, so the \
+                         chunk is unfinished, not finished. Its last words were: {}",
+                        line.chars().take(300).collect::<String>()
                     );
                 }
                 return Ok(line);
@@ -1034,6 +1066,24 @@ mod tests {
 
         // The property that broke: no file on disk, no clock, same answer.
         assert_eq!(rank_free_models(&catalogue, &[], None), plain);
+    }
+
+    /// The live shape this locks: one `list_dir`, then a paragraph of prose, and
+    /// the chunk had been reported as finished.
+    #[test]
+    fn only_a_done_line_at_the_start_of_a_line_ends_a_chunk() {
+        assert!(has_done_line("DONE: wrote calculator.html and read it back"));
+        // Models wrap the signal in the markdown they were told to avoid.
+        assert!(has_done_line("**DONE:** wrote the file"));
+        assert!(has_done_line("- DONE: file written"));
+        assert!(has_done_line("`DONE:` verified"));
+        assert!(has_done_line("list_dir shows nothing yet\nDONE: gave up"));
+        // A refusal that merely mentions the word is not a handoff.
+        assert!(!has_done_line("I cannot mark this DONE because the provider refused."));
+        assert!(!has_done_line("The task is done, everything is fine"));
+        assert!(!has_done_line(""));
+        // Not buried mid-sentence either: only line-initial counts.
+        assert!(!has_done_line("then I said DONE: and kept talking"));
     }
 
     #[test]

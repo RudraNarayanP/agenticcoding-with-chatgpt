@@ -159,6 +159,10 @@ pub fn run(args: &DelegateArgs) -> Result<()> {
             }
             Err(e) => {
                 failed += 1;
+                // Whatever just failed, this model is not proven for the job,
+                // and the next run must not be steered straight back to it by
+                // the cache.
+                openrouter::forget_verified();
                 format!("FAILED: {e:#}")
             }
         };
@@ -185,19 +189,62 @@ pub fn run(args: &DelegateArgs) -> Result<()> {
     }
 
     // ---- closing verdict ----------------------------------------------------
+    //
+    // The exit code is the only thing a script has, and this used to answer 0 no
+    // matter what: a live run wrote nothing, the planner's closing review said
+    // "REVISE, both execution chunks were refused by the provider", and the
+    // process still reported success.
+    let mut accepted = failed == 0;
+    let mut verdict = String::from("--no-review: no verdict asked");
     if !args.no_review {
         eprintln!("[review] asking the planner to judge the result");
         match channel.send(&final_report(&packet, &completed, failed)) {
-            Ok(reply) => println!("{}", reply.trim()),
-            Err(e) => eprintln!(
-                "[review] final review failed ({e:#}); reporting the executor log instead"
-            ),
+            Ok(reply) => {
+                println!("{}", reply.trim());
+                accepted = review_accepted(&reply);
+                verdict = one_line(&reply);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[review] final review failed ({e:#}); reporting the executor log instead"
+                );
+                accepted = false;
+                verdict = format!("review turn failed: {e:#}");
+            }
         }
     } else {
         println!("{}", completed.join("\n"));
     }
     channel.close();
+
+    if failed > 0 {
+        bail!(
+            "{failed} of {} chunk(s) did not finish, and the executor's work on disk is \
+             unverified. Planner verdict: {verdict}",
+            completed.len()
+        );
+    }
+    if !accepted {
+        bail!(
+            "the planner did not accept the result (it said: {verdict}); nothing is \
+             guaranteed on disk"
+        );
+    }
     Ok(())
+}
+
+/// Did the closing review accept the work?
+///
+/// Anything that is not an explicit proceed counts as not accepted, including a
+/// reply that mentions both words: "REVISE, do not proceed" is a revise. A
+/// verdict this coarse is safe to fail closed on, because the cost of the wrong
+/// guess is one more run rather than a build pipeline trusting an empty directory.
+pub fn review_accepted(reply: &str) -> bool {
+    let up = reply.to_ascii_uppercase();
+    if up.contains("REVISE") || up.contains("BLOCKED") || up.contains("NOT ACCEPT") {
+        return false;
+    }
+    up.contains("PROCEED") || up.contains("VERDICT: PASS") || up.contains("ALL ACCEPTANCE MET")
 }
 
 /// `--file` contents as one context block, matching `ask`'s shape so the planner
@@ -305,6 +352,26 @@ fn one_line(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::delegation::PlanStep;
+
+    /// The exit code is the deliverable for anything that scripts this command,
+    /// and the first live end-to-end run produced no files, exited 0, and carried
+    /// this exact review as its last line.
+    #[test]
+    fn a_review_that_did_not_accept_is_not_a_success() {
+        // Verbatim shape of the real reply.
+        let live = "REVISE\n\nThe implementation was not completed or verified because both \
+                    execution chunks were refused by the provider.\ncalculator.html and \
+                    NOTES.md still need to be created.";
+        assert!(!review_accepted(live));
+
+        assert!(review_accepted("verdict: PROCEED\nAll acceptance criteria are met."));
+        assert!(review_accepted("PROCEED"));
+        // Both words present: the refusing reading wins, because the cost of
+        // guessing wrong here is a pipeline trusting an empty directory.
+        assert!(!review_accepted("PROCEED? No -- REVISE this."));
+        // A garbled reply that says neither is not evidence of acceptance.
+        assert!(!review_accepted("I am not sure what happened."));
+    }
 
     fn packet() -> DelegationPacket {
         DelegationPacket {
