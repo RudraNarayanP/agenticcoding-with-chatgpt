@@ -296,6 +296,45 @@ fn cancel_requested() -> bool {
         .unwrap_or(false)
 }
 
+/// Did the page accept our submit? `baseline` is the user-turn count taken
+/// before Enter was pressed, `users_now` is that count now (`None` when the page
+/// could not be read at all), and `stop_now` is whether it is generating.
+///
+/// Pure, so the two ways this decision can be wrong are testable without a
+/// browser: a dropped read must never read as "submitted" (the caller would then
+/// believe in a message that is not there), and a turn that started must never be
+/// dismissed because its speech bubble has not painted yet.
+fn submit_accepted(baseline: u64, users_now: Option<u64>, stop_now: bool) -> bool {
+    stop_now || users_now.is_some_and(|n| n > baseline)
+}
+
+/// Re-read the two counters the loss checks compare against, after a reattach.
+///
+/// Both baselines were taken from the page we just LOST, and a freshly loaded
+/// ChatGPT conversation legitimately reports fewer of each: only the messages
+/// near the viewport are in the DOM, so reloading a long chat shows fewer user
+/// bubbles and fewer assistant nodes than the render we had been watching.
+/// Measured against the old numbers that reads as "the page was replaced"
+/// permanently, and the reattach it triggers hands back the same smaller page
+/// again — that loop is what ran 38 times in a live run. `assistant_count`
+/// takes the minimum rather than the new value, so a reply that genuinely
+/// arrives still counts as new against either baseline.
+fn rebase_from_page(
+    ch: &Channel,
+    budget: f64,
+    baseline_users: &mut u64,
+    baseline_count: &mut u64,
+) {
+    if let Ok(v) = ab_eval(&ch.ab, JS_STATE_CHEAP, &ch.session, budget) {
+        if let Some(n) = v.get("user_count").and_then(|x| x.as_u64()) {
+            *baseline_users = n;
+        }
+        if let Some(n) = v.get("assistant_count").and_then(|x| x.as_u64()) {
+            *baseline_count = (*baseline_count).min(n);
+        }
+    }
+}
+
 /// Sleep that wakes early for a cancel.
 fn nap(d: Duration) {
     let end = Instant::now() + d;
@@ -1417,13 +1456,27 @@ impl Channel {
             .context("pressing Enter to submit")
             .map_err(SubmitFailure::Ambiguous)?;
 
-        // Confirm the submit actually landed, by EVIDENCE (a new user turn was
-        // rendered) rather than by the old proxy "is the composer empty?". That
-        // proxy raced React's clear and misread in both directions: a slow clear
-        // looked like a failed submit (→ duplicate send), and a swallowed Enter
-        // with an already-cleared box looked like success (→ we then waited on,
-        // and scraped, the PREVIOUS turn).
-        if !self.await_user_turn(baseline_users, Duration::from_secs(3), budget) {
+        // Confirm the submit actually landed, by EVIDENCE rather than by the old
+        // proxy "is the composer empty?". That proxy raced React's clear and
+        // misread in both directions: a slow clear looked like a failed submit
+        // (→ duplicate send), and a swallowed Enter with an already-cleared box
+        // looked like success (→ we then waited on, and scraped, the PREVIOUS
+        // turn).
+        //
+        // Two pieces of evidence now count: the user turn appearing, and the page
+        // starting to generate. The second one is what makes this survive a slow
+        // front end. Measured on the live account: a planning turn was refused
+        // with "the message was never submitted" while the tab was plainly idle
+        // with an empty composer, because a 3 s + 5 s window on ONE signal was
+        // all we allowed ChatGPT to re-render a message underneath a browser that
+        // was holding 2.9 GB on a machine with 2.2 GB of RAM free. Whether the
+        // turn rendered is the page's business; whether it accepted the message
+        // is ours, and generation starting is that fact.
+        //
+        // A stop button already up from a PREVIOUS turn cannot fake it: nothing
+        // here reaches a submit while the page is generating, because
+        // `fill_composer` waits out and then refuses exactly that state.
+        if !self.await_submit(baseline_users, Duration::from_secs(6), budget) {
             // Enter didn't take. Click the send button and demand evidence again.
             // Note this fallback is naturally inert if the submit did land after
             // all: once generation starts, the send button becomes the stop
@@ -1434,7 +1487,7 @@ impl Channel {
                 &self.session,
                 budget,
             );
-            if !self.await_user_turn(baseline_users, Duration::from_secs(5), budget) {
+            if !self.await_submit(baseline_users, Duration::from_secs(10), budget) {
                 return Err(SubmitFailure::Ambiguous(anyhow!(
                     "the message was never submitted — no new user turn appeared \
                      after pressing Enter and clicking the send button. The \
@@ -1628,13 +1681,19 @@ impl Channel {
             .and_then(|v| v.as_u64())
     }
 
-    /// Poll up to `within` for the user-turn count to exceed `baseline` — i.e.
-    /// for positive evidence that our submit was accepted.
-    fn await_user_turn(&self, baseline: u64, within: Duration, budget: f64) -> bool {
+    /// Poll up to `within` for positive evidence that our submit was accepted:
+    /// a new user turn rendered, OR the page having started to generate.
+    fn await_submit(&self, baseline: u64, within: Duration, budget: f64) -> bool {
         let until = Instant::now() + within;
         loop {
-            if self.user_turn_count(budget).is_some_and(|n| n > baseline) {
-                return true;
+            // One cheap call answers both questions. It is the same script the
+            // reply-wait poll uses, so this adds no new page-scrape cost.
+            if let Some(v) = ab_eval(&self.ab, JS_STATE_CHEAP, &self.session, budget).ok() {
+                let users = v.get("user_count").and_then(|n| n.as_u64());
+                let stop = v.get("stop").and_then(|s| s.as_bool()).unwrap_or(false);
+                if submit_accepted(baseline, users, stop) {
+                    return true;
+                }
             }
             if Instant::now() >= until {
                 return false;
@@ -1911,7 +1970,7 @@ impl Channel {
 
         // Re-read the assistant baseline: if we reattached above, the reloaded
         // page reflects the server's view and the pre-crash count is meaningless.
-        let baseline_count = baseline_count.min(
+        let mut baseline_count = baseline_count.min(
             ab_eval(
                 &self.ab,
                 JS_ASSISTANT_COUNT,
@@ -1944,6 +2003,14 @@ impl Channel {
         // navigation hiccup and reads as "the tab is gone".
         const LOST_POLLS_BEFORE_REATTACH: u32 = 3;
         let mut lost_polls = 0u32;
+        // A reattach is a navigation, and a navigation is the expensive thing in
+        // this whole file. Live, a run reattached 38 times in a row over five
+        // minutes without ever settling, because the check that triggers it was
+        // written to be a one-way ratchet (see the re-baseline below). Without a
+        // ceiling the loop runs until the wall-clock timeout, so the run that
+        // looks "stuck and hot" is this and not the model.
+        const MAX_REATTACHES: u32 = 3;
+        let mut reattaches = 0u32;
 
         // How often to ask the server instead of the page. Every 10th ~2s poll.
         const SERVER_CHECK_EVERY: u64 = 10;
@@ -2061,9 +2128,25 @@ impl Channel {
                 if self.convo_id.is_some() {
                     lost_polls += 1;
                     if lost_polls >= LOST_POLLS_BEFORE_REATTACH {
+                        if reattaches >= MAX_REATTACHES {
+                            bail!(
+                                "the ChatGPT page would not show this conversation after \
+                                 {reattaches} reattach attempts (last user-turn count read: \
+                                 {users_now:?}, we expected more than {baseline_users}). The \
+                                 reply may well be finished in your browser; this run cannot \
+                                 read it."
+                            );
+                        }
+                        reattaches += 1;
+                        eprintln!(
+                            "[{:5}.0s] the page no longer shows this turn's user message; \
+                             reattaching ({reattaches}/{MAX_REATTACHES})",
+                            started.elapsed().as_secs()
+                        );
                         self.reopen_pinned(remaining_secs())
                             .context("lost the ChatGPT tab and could not reattach")?;
                         lost_polls = 0;
+                        rebase_from_page(self, remaining_secs(), &mut baseline_users, &mut baseline_count);
                     }
                     continue;
                 }
@@ -2093,9 +2176,29 @@ impl Channel {
                 (Some(_), _) => {
                     lost_polls += 1;
                     if lost_polls >= LOST_POLLS_BEFORE_REATTACH {
+                        if reattaches >= MAX_REATTACHES {
+                            bail!(
+                                "the ChatGPT page kept showing a conversation other than the \
+                                 one this run pinned ({:?}), after {reattaches} reattach \
+                                 attempts.",
+                                self.convo_id
+                            );
+                        }
+                        reattaches += 1;
+                        eprintln!(
+                            "[{:5}.0s] the page moved off our conversation; reattaching \
+                             ({reattaches}/{MAX_REATTACHES})",
+                            started.elapsed().as_secs()
+                        );
                         self.reopen_pinned(remaining_secs())
                             .context("lost the ChatGPT tab and could not reattach")?;
                         lost_polls = 0;
+                        rebase_from_page(
+                            self,
+                            remaining_secs(),
+                            &mut baseline_users,
+                            &mut baseline_count,
+                        );
                     }
                     continue;
                 }
@@ -3292,6 +3395,30 @@ fn detect_logged_in_profiles() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A submit used to be believed only if the user bubble had rendered. On a
+    /// browser under memory pressure the page accepts the message and starts
+    /// generating seconds before it paints that bubble, and the whole run died
+    /// with "the message was never submitted" against a tab that was, checked by
+    /// hand, idle with an empty composer. Generation starting is the same fact
+    /// with a shorter path to it.
+    #[test]
+    fn a_submit_is_accepted_by_either_signal_and_by_a_dropped_read_of_neither() {
+        // The bubble rendered: accepted, as always.
+        assert!(submit_accepted(0, Some(1), false));
+        // Generation began and the bubble has not painted yet. This is the case
+        // that used to abort a good planning turn.
+        assert!(submit_accepted(3, Some(3), true));
+        // Readable page, nothing moved: genuinely not submitted, so the caller
+        // may still fall back to clicking the send button.
+        assert!(!submit_accepted(3, Some(3), false));
+        // A page we cannot read proves nothing, and must not be reported as a
+        // submit -- that is how a message gets sent twice.
+        assert!(!submit_accepted(3, None, false));
+        // But a page that reads itself as generating has said so, even if the
+        // count field was missing from the same reply.
+        assert!(submit_accepted(3, None, true));
+    }
+
     /// The poll loop runs every 2s for the whole length of a reply, and does it
     /// inside the user's own browser. `innerText` is not a string read: it forces
     /// a synchronous layout of the node, and the node is a markdown message being
