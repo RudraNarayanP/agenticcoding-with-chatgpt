@@ -150,7 +150,13 @@ pub fn run(args: &DelegateArgs) -> Result<()> {
             args.permission_mode,
         );
         let line = match outcome {
-            Ok(done) => done,
+            Ok(done) => {
+                // A chunk that ran to completion is proof the model is usable
+                // *for this job*, which is exactly what the next run wants to
+                // know. The resolver tries this first and skips its probes.
+                openrouter::remember_verified(&client.model);
+                done
+            }
             Err(e) => {
                 failed += 1;
                 format!("FAILED: {e:#}")

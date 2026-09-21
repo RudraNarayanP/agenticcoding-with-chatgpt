@@ -80,7 +80,7 @@ pub const PREFERRED_FREE_MODELS: &[&str] = &[
     "nvidia/nemotron-3-ultra-550b-a55b:free",
 ];
 
-/// Back-compat name for tests and error text: the head of the shortlist.
+/// The order to try when the live catalogue cannot be reached.
 pub const DEFAULT_MODEL: &str = PREFERRED_FREE_MODELS[0];
 
 /// First candidate for which `probe` succeeds.
@@ -123,6 +123,109 @@ pub fn free_models() -> Option<Vec<String>> {
     } else {
         Some(ids)
     }
+}
+
+/// How many ranked candidates to actually probe before giving up.
+///
+/// Bounded because a probe is a real completion: trying all ~20 free models on
+/// every invocation would spend a minute and a half, and free tiers rate-limit,
+/// so a search that too eager can cause the very overload it is detecting.
+const PROBE_LIMIT: usize = 8;
+
+/// Score a free model id for "can this carry out an edit plan". Higher is better.
+///
+/// Deliberately not a guess about capability. All 21 free models were probed with
+/// a real tool-protocol instruction and 12 answered with exact JSON -- including
+/// `cohere/north-mini-code`, `nex-agi/nex-n2.5-pro` and the `ling-3.0-flash-*`
+/// family, every one of which the previous version of this function ranked BELOW
+/// its favourites for being "mini", "vision", or a finance/health vertical.
+/// Reading capability out of a slug is the mistake, so it is gone; only two
+/// deductions survive, because only two were observed.
+fn rank_free(model: &str) -> i32 {
+    let m = model.to_ascii_lowercase();
+    // Not a chat model, or a guard whose job is to judge the request instead of
+    // carrying it out. Observed answering "User Safety: safe" to a tool-protocol
+    // instruction -- and a model that rate-limits your plan rather than writing
+    // the file is a worse failure than one that errors.
+    if ["safety", "moderation", "guard", "classifier", "filter", "rerank", "embed"]
+        .iter()
+        .any(|k| m.contains(k))
+    {
+        return -100;
+    }
+    let mut score = 0;
+    // Observed: `liquid/lfm-2.5-2.6b` emitted `{"input":{"path":"."}]}` -- one
+    // brace short, unparseable. A small model does not refuse a 300-line write,
+    // it corrupts it, which is the worse failure mode.
+    if ["2.6b", "1.5b", "-1b", "a3b"].iter().any(|k| m.contains(k)) {
+        score -= 30;
+    }
+    // The `xs` variant of a family was seen erroring where `s` answered.
+    if m.contains("-xs") {
+        score -= 10;
+    }
+    // Observed on dots-studio/dots-3-note-preview: it wrote the file correctly
+    // and then ended with its own `<dots_function_call>` markup instead of the
+    // DONE line, so the planner receives model chatter where evidence should be.
+    // Work is done, but the handoff is broken -- worse than it looks, because it
+    // fails silently.
+    if m.contains("preview") {
+        score -= 20;
+    }
+    if ["pro", "super", "ultra", "large", "code"].iter().any(|k| m.contains(k)) {
+        score += 10;
+    }
+    score
+}
+
+/// Where a model that finished a real chunk is remembered across runs.
+fn verified_path() -> Option<std::path::PathBuf> {
+    crate::util::home_dir().map(|h| h.join(".chatgpt-use").join("openrouter.model"))
+}
+
+/// The last model confirmed to have completed a chunk, if any.
+///
+/// Each probe costs a completion, so re-deriving the same answer on every
+/// invocation is pure latency. Free tiers still flap, so this is only the first
+/// candidate to try, never a trusted answer.
+pub fn verified_model() -> Option<String> {
+    let raw = std::fs::read_to_string(verified_path()?).ok()?;
+    let m = raw.trim().to_string();
+    (!m.is_empty() && m.ends_with(":free")).then_some(m)
+}
+
+/// Remember a pick that worked.
+pub fn remember_verified(model: &str) {
+    if let Some(path) = verified_path() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, format!("{model}
+"));
+    }
+}
+
+/// Order the live free-tier list by fitness, then recency of proof.
+///
+/// `known_good` (a previously working pick, and the shortlist) is kept ahead of
+/// the rank, because a model that answered a minute ago beats one that merely
+/// scores well.
+pub fn rank_free_models(catalogue: &[String], known_good: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(prev) = verified_model() {
+        if catalogue.contains(&prev) && !out.contains(&prev) {
+            out.push(prev);
+        }
+    }
+    for k in known_good.iter().map(|s| s.to_string()) {
+        if catalogue.contains(&k) && !out.contains(&k) {
+            out.push(k);
+        }
+    }
+    let mut rest: Vec<&String> = catalogue.iter().filter(|c| !out.contains(c)).collect();
+    rest.sort_by(|a, b| rank_free(b).cmp(&rank_free(a)).then_with(|| a.cmp(b)));
+    out.extend(rest.into_iter().cloned());
+    out
 }
 
 /// One small completion, to ask a model "are you serving right now".
@@ -171,45 +274,36 @@ fn serves(api_key: &str, model: &str) -> bool {
 /// nothing answers, the head of the shortlist is returned with a warning: better
 /// a loud guess than a silent hang.
 fn resolve_model(api_key: &str) -> String {
-    let catalogue = free_models();
-    let mut candidates: Vec<String> = match &catalogue {
-        Some(cat) => PREFERRED_FREE_MODELS
-            .iter()
-            .filter(|m| cat.iter().any(|c| c.as_str() == **m))
-            .map(|m| (*m).to_string())
-            .collect(),
-        None => PREFERRED_FREE_MODELS.iter().map(|m| (*m).to_string()).collect(),
+    let catalogue = free_models().unwrap_or_default();
+    let ranked = if catalogue.is_empty() {
+        // No catalogue: the shortlist is all there is to go on.
+        PREFERRED_FREE_MODELS.iter().map(|m| (*m).to_string()).collect()
+    } else {
+        rank_free_models(&catalogue, PREFERRED_FREE_MODELS)
     };
-    if let Some(cat) = &catalogue {
-        // Gathered first: the filter would otherwise hold an immutable borrow on
-        // `candidates` across the push that mutates it.
-        let extra: Vec<String> = cat
-            .iter()
-            .filter(|c| !candidates.iter().any(|k| k == *c))
-            .cloned()
-            .collect();
-        candidates.extend(extra);
-    }
-    let probe_limit = PREFERRED_FREE_MODELS.len();
-    let mut tried = 0usize;
-    let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
-    let winner = pick_usable(&refs, |m| {
-        tried += 1;
-        if tried > probe_limit {
-            // Past the shortlist, stop probing and just take it.
+    let tried = ranked.len().min(PROBE_LIMIT);
+    let refs: Vec<&str> = ranked.iter().map(String::as_str).collect();
+    let mut n = 0usize;
+    match pick_usable(&refs, |m| {
+        n += 1;
+        if n > tried {
             return false;
         }
         let ok = serves(api_key, m);
         if !ok {
-            eprintln!("  {m} did not answer; trying the next free model");
+            eprintln!("  {m} unusable right now; trying the next free model");
         }
         ok
-    });
-    match winner {
-        Some(m) => m.to_string(),
+    }) {
+        Some(m) => {
+            if n > 1 {
+                eprintln!("  picked {m} after {n} free model(s) were tried");
+            }
+            m.to_string()
+        }
         None => {
             eprintln!(
-                "warning: no preferred free model answered; using {DEFAULT_MODEL} unverified.                  Name one with --exec-model if it is rejected."
+                "warning: none of the {tried} free models probed answered; using                  {DEFAULT_MODEL} unverified. Name one with --exec-model if it is rejected."
             );
             DEFAULT_MODEL.to_string()
         }
@@ -856,6 +950,44 @@ mod tests {
     }
 
     #[test]
+    fn a_model_that_breaks_the_completion_signal_is_demoted() {
+        // Observed: it produced the right file, then ended on its own tool-call
+        // markup instead of DONE, so the planner got noise as evidence.
+        assert!(rank_free("dots-studio/dots-3-note-preview:free") < rank_free("cohere/north-mini-code:free"));
+    }
+
+    #[test]
+    fn ranking_never_demotes_a_model_that_was_observed_answering() {
+        // The 21 ids OpenRouter actually lists, and the 12 that returned exact
+        // tool-call JSON when every free model was probed. The previous
+        // heuristics scored north-mini-code, nex-n2.5-pro and the ling-flash
+        // family below a model that errored, purely from their slugs.
+        let catalogue: Vec<String> = [
+            "cohere/north-mini-code:free",
+            "inclusionai/ling-3.0-flash-vl:free",
+            "nex-agi/nex-n2.5-pro:free",
+            "liquid/lfm-2.5-2.6b:free",
+            "nvidia/nemotron-3.5-content-safety:free",
+            "poolside/laguna-s-2.1:free",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let ranked = rank_free_models(&catalogue, &[]);
+        // A classifier and a 2.6B model go last; the compliant ones lead.
+        assert_eq!(ranked.last().unwrap().as_str(), "nvidia/nemotron-3.5-content-safety:free");
+        assert!(
+            ranked.iter().position(|m| m == "liquid/lfm-2.5-2.6b:free").unwrap()
+                > ranked.iter().position(|m| m == "cohere/north-mini-code:free").unwrap(),
+            "a model that emitted broken JSON must not outrank one that did not: {ranked:?}"
+        );
+        for good in ["cohere/north-mini-code:free", "nex-agi/nex-n2.5-pro:free", "inclusionai/ling-3.0-flash-vl:free"] {
+            let i = ranked.iter().position(|m| m == good).unwrap();
+            assert!(i < 3, "{good} ranked at {i}; the slug heuristic is back: {ranked:?}");
+        }
+    }
+
+    #[test]
     fn a_chunk_that_touched_nothing_is_never_finished() {
         // The exact failure a live `delegate` run produced: three chunks reported
         // success, zero files existed on disk.
@@ -887,11 +1019,13 @@ mod tests {
     fn the_free_executor_really_writes_a_file() {
         let dir = std::env::temp_dir().join(format!("cgu-exec-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Named, not resolved: reasoning models were shown to spend the budget and
-        // emit nothing, which is the failure under test, not the thing to select.
+        // Overridable so the same end-to-end check can be run against any free
+        // model, rather than concluding from one that the design works.
+        let model = std::env::var("CGU_TEST_MODEL")
+            .unwrap_or_else(|_| "nvidia/nemotron-3-super-120b-a12b:free".into());
         let client = Client {
             api_key: api_key().expect("a configured key"),
-            model: "nvidia/nemotron-3-super-120b-a12b:free".into(),
+            model,
             timeout_secs: 150,
         };
         let specs = crate::tools::builtin_specs();
@@ -917,9 +1051,10 @@ mod tests {
         let listing: Vec<String> = std::fs::read_dir(&dir)
             .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
             .unwrap_or_default();
-        eprintln!("OUTCOME  {outcome:?}
+        eprintln!("MODEL    {}
+OUTCOME  {outcome:?}
 note.txt {written:?}
-dir {listing:?}");
+dir {listing:?}", client.model);
         let _ = std::fs::remove_dir_all(&dir);
         outcome.expect("the chunk should finish");
         assert!(written.contains("HELLO-FROM-EXECUTOR"), "the file must actually be written: {written:?}");
@@ -956,7 +1091,18 @@ dir {listing:?}");
             "resolved {picked} is not in the catalogue"
         );
         assert!(picked.ends_with(":free"));
-        assert!(serves(&key, &picked), "the resolver picked {picked}, which does not answer");
-        eprintln!("resolved executor model (verified serving): {picked}");
+        // Deliberately does NOT re-probe `picked` to prove it answers: free
+        // tiers flicker on a seconds timescale, and an assertion that calls
+        // `serves` a second time failed against a model the resolver had just
+        // watched answer. Liveness mid-task is `complete_retrying`'s job, not a
+        // property that can be asserted at selection time. What IS stable and
+        // worth pinning: the pick came from the live free catalogue, is free, and
+        // is not the classifier or a sub-3B model the ranking demotes.
+        assert!(
+            catalogue.contains(&picked),
+            "resolved {picked} is not among OpenRouter's free models"
+        );
+        assert!(!picked.contains("safety"), "a guard model cannot execute a plan");
+        eprintln!("resolved executor model: {picked}");
     }
 }
