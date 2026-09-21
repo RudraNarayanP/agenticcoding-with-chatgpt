@@ -207,12 +207,24 @@ pub fn remember_verified(model: &str) {
 
 /// Order the live free-tier list by fitness, then recency of proof.
 ///
-/// `known_good` (a previously working pick, and the shortlist) is kept ahead of
-/// the rank, because a model that answered a minute ago beats one that merely
+/// `known_good` (the shortlist) is kept ahead of the rank, and `verified` ahead
+/// of that, because a model that answered a minute ago beats one that merely
 /// scores well.
-pub fn rank_free_models(catalogue: &[String], known_good: &[&str]) -> Vec<String> {
+///
+/// `verified` is a parameter rather than a read of `verified_model()` inside
+/// here. This function is the one the tests call to prove the ranking is
+/// evidence-based, and it used to open the user's cache file by itself: the same
+/// input then ranked differently depending on what the last live run had
+/// written, which is a test that cannot be trusted and a ordering that cannot be
+/// reasoned about. Reading the file belongs in `resolve_model`, at the edge.
+pub fn rank_free_models(
+    catalogue: &[String],
+    known_good: &[&str],
+    verified: Option<&str>,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    if let Some(prev) = verified_model() {
+    if let Some(prev) = verified {
+        let prev = prev.to_string();
         if catalogue.contains(&prev) && !out.contains(&prev) {
             out.push(prev);
         }
@@ -279,7 +291,7 @@ fn resolve_model(api_key: &str) -> String {
         // No catalogue: the shortlist is all there is to go on.
         PREFERRED_FREE_MODELS.iter().map(|m| (*m).to_string()).collect()
     } else {
-        rank_free_models(&catalogue, PREFERRED_FREE_MODELS)
+        rank_free_models(&catalogue, PREFERRED_FREE_MODELS, verified_model().as_deref())
     };
     let tried = ranked.len().min(PROBE_LIMIT);
     let refs: Vec<&str> = ranked.iter().map(String::as_str).collect();
@@ -973,7 +985,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let ranked = rank_free_models(&catalogue, &[]);
+        let ranked = rank_free_models(&catalogue, &[], None);
         // A classifier and a 2.6B model go last; the compliant ones lead.
         assert_eq!(ranked.last().unwrap().as_str(), "nvidia/nemotron-3.5-content-safety:free");
         assert!(
@@ -985,6 +997,43 @@ mod tests {
             let i = ranked.iter().position(|m| m == good).unwrap();
             assert!(i < 3, "{good} ranked at {i}; the slug heuristic is back: {ranked:?}");
         }
+    }
+
+    /// A live `delegate` run wrote its verified model into ~/.chatgpt-use and
+    /// silently changed what this file's own tests returned, because the ranking
+    /// read the cache from inside itself. Proof still has to be allowed to beat
+    /// score -- that is why the cache exists -- so it moved to the caller as an
+    /// argument and this pins both halves.
+    #[test]
+    fn proof_beats_score_and_the_same_input_always_ranks_the_same() {
+        let catalogue: Vec<String> = [
+            "cohere/north-mini-code:free",
+            "poolside/laguna-s-2.1:free",
+            "nvidia/nemotron-3.5-content-safety:free",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let plain = rank_free_models(&catalogue, &[], None);
+        assert_eq!(plain[0], "cohere/north-mini-code:free");
+        assert_eq!(plain[1], "poolside/laguna-s-2.1:free");
+        assert_eq!(plain[2], "nvidia/nemotron-3.5-content-safety:free");
+
+        // North-mini-code outscores poolside on its slug, and poolside answered
+        // last time, so the cache has to win.
+        let with_proof = rank_free_models(&catalogue, &[], Some("poolside/laguna-s-2.1:free"));
+        assert_eq!(with_proof[0], "poolside/laguna-s-2.1:free");
+        assert_eq!(with_proof[1], "cohere/north-mini-code:free");
+        assert_eq!(with_proof.len(), plain.len(), "no model invented or lost");
+
+        // A cache entry for a model OpenRouter no longer offers is dropped, not
+        // pushed to the front of a run that cannot possibly serve it.
+        let stale = rank_free_models(&catalogue, &[], Some("ghost/dead-model:free"));
+        assert_eq!(stale, plain);
+
+        // The property that broke: no file on disk, no clock, same answer.
+        assert_eq!(rank_free_models(&catalogue, &[], None), plain);
     }
 
     #[test]
