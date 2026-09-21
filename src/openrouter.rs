@@ -254,11 +254,13 @@ pub fn rank_free_models(
 
 /// One small completion, to ask a model "are you serving right now".
 ///
-/// The budget is 64 tokens, not a tiny handful, and that number is load-bearing:
-/// several free models reason before they emit, so a tight cap starves them into
-/// `Provider returned error` and a 4-token probe reports a perfectly usable model
-/// as dead. Measured on `poolside/laguna-s-2.1:free`: fails at 4 and 16, answers
-/// at 64. The retry exists for the same reason -- free providers flap.
+/// The budget is 64 tokens, not a tiny handful: free providers truncate
+/// aggressively, and a 4-token probe reports a perfectly usable model as dead.
+/// The retry exists for the same reason -- free providers flap.
+///
+/// The body carries `"reasoning":{"effort":"none"}` exactly as `request_body`
+/// does, because a probe that asks a model to think and an executor that tells it
+/// not to are testing two different models.
 ///
 /// Probing rather than trusting the model list is deliberate: the list reflects
 /// what OpenRouter offers, not what is answering at this moment.
@@ -270,7 +272,7 @@ fn serves(api_key: &str, model: &str) -> bool {
         .args([
             "--data-binary",
             &format!(
-                r#"{{"model":"{model}","messages":[{{"role":"user","content":"Reply with only: ok"}}],"max_tokens":64,"temperature":0}}"#
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"Reply with only: ok"}}],"max_tokens":64,"temperature":0,"reasoning":{{"effort":"none"}}}}"#
             ),
         ])
         .arg("https://openrouter.ai/api/v1/chat/completions");
@@ -462,7 +464,10 @@ impl Client {
             .with_context(|| format!("parsing OpenRouter response (model {})", self.model))?;
         if reply.trim().is_empty() {
             bail!(
-                "{} returned no content. Free reasoning models sometimes spend the whole                  token budget thinking; try --exec-model with a non-reasoning model.",
+                "{} answered with an empty message. Reasoning is switched off in the request, \
+                 so this is not a model that thought instead of typing -- it is a provider that \
+                 accepted the call and returned nothing. Retry, or name another model with \
+                 --exec-model.",
                 self.model
             );
         }
@@ -483,6 +488,18 @@ impl Client {
             // budget consumed entirely by hidden reasoning comes back as empty
             // content -- which `run_chunk` now treats as the failure it is.
             "max_tokens": 8192,
+            // Turn the thinking off. This is the whole economic premise of the
+            // command -- ChatGPT did the reasoning, the free model is only here
+            // to type -- and without it a free thinking model spends the
+            // entire budget on hidden tokens instead of the file. Measured on
+            // `cohere/north-mini-code:free` asked to write calculator.html:
+            //   default          finish=length, 0 content, 31,407 chars thinking
+            //   effort:"none"    finish=stop, 6,009 chars of valid tool-call JSON
+            // Cheaper and more content on every model checked: nemotron-ultra
+            // 4,649 -> 2,131 completion tokens, ling-flash 2,632 -> 1,426. The
+            // OpenRouter-documented `thinking:{type:"disabled"}` is NOT the
+            // parameter that works here; it left the model thinking.
+            "reasoning": { "effort": "none" },
         })
     }
 
@@ -572,9 +589,43 @@ fn parse_completion(raw: &str) -> Result<String> {
     let content = choice
         .pointer("/message/content")
         .and_then(|c| c.as_str())
-        .or_else(|| choice.get("text").and_then(|t| t.as_str()))
-        .context("choice carried no content")?;
-    Ok(content.to_string())
+        .or_else(|| choice.get("text").and_then(|t| t.as_str()));
+    match content {
+        Some(c) => Ok(c.to_string()),
+        // A model that thinks instead of typing comes back with `content: null`
+        // and nothing to show for it. Say which of the two failure shapes it is,
+        // because they need opposite responses: `length` means the budget was
+        // eaten by hidden reasoning, any other finish reason means the model
+        // answered nothing at all.
+        None => {
+            let finish = choice
+                .get("finish_reason")
+                .and_then(|f| f.as_str())
+                .unwrap_or("unknown");
+            let thought = choice
+                .pointer("/message/reasoning")
+                .and_then(|r| r.as_str())
+                .or_else(|| choice.pointer("/message/reasoning_content").and_then(|r| r.as_str()))
+                .map(str::len)
+                .unwrap_or(0);
+            let spent = v
+                .pointer("/usage/completion_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0);
+            bail!(
+                "the model returned no content (finish_reason={finish}, {thought} characters of \
+                 hidden reasoning, {spent} completion tokens). {}",
+                if finish == "length" {
+                    "It spent the whole token budget thinking rather than answering -- raise \
+                     --exec-timeout only helps if the provider is also slow; the fix is a model \
+                     that answers, or --exec-model naming one."
+                } else {
+                    "Nothing was produced at all; this is a provider that accepted the request \
+                     and returned an empty message."
+                }
+            )
+        }
+    }
 }
 
 /// One chunk of a plan: the steps this executor session is responsible for.
@@ -1084,6 +1135,55 @@ mod tests {
         assert!(!has_done_line(""));
         // Not buried mid-sentence either: only line-initial counts.
         assert!(!has_done_line("then I said DONE: and kept talking"));
+    }
+
+    /// The premise of `delegate` is that ChatGPT thinks and the free model types.
+    /// Measured on the calculator chunk, `cohere/north-mini-code:free` spent all
+    /// 8,192 tokens on hidden reasoning and returned zero content; the same call
+    /// with thinking off returned 6,009 characters of valid tool-call JSON in
+    /// 1,442 tokens. Losing the parameter loses the feature.
+    #[test]
+    fn the_executor_request_turns_thinking_off() {
+        let c = Client {
+            api_key: "test".into(),
+            model: "cohere/north-mini-code:free".into(),
+            timeout_secs: 30,
+        };
+        let body = c.request_body(&[Message::user("hi")]);
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(|v| v.as_str()),
+            Some("none"),
+            "the executor must not be allowed to spend the budget thinking: {body}"
+        );
+        // Free tiers queue; a paid default would break the "costs nothing" claim.
+        assert!(require_free(&c.model).is_ok());
+    }
+
+    /// "It returned nothing" and "it thought instead of answering" look the same
+    /// downstream and need opposite fixes, so the parser tells them apart.
+    #[test]
+    fn an_empty_reply_says_whether_the_budget_went_to_thinking() {
+        let truncated = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "reasoning":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"finish_reason":"length"}],
+            "usage":{"completion_tokens":8192}}"#;
+        let msg = parse_completion(truncated).unwrap_err().to_string();
+        assert!(msg.contains("finish_reason=length"), "{msg}");
+        assert!(msg.contains("characters of hidden reasoning"), "{msg}");
+        assert!(msg.contains("8192 completion tokens"), "{msg}");
+
+        let silent = r#"{"choices":[{"message":{"role":"assistant"},"finish_reason":"stop"}]}"#;
+        let msg = parse_completion(silent).unwrap_err().to_string();
+        assert!(msg.contains("Nothing was produced at all"), "{msg}");
+
+        // The shapes that do work still parse, including the older `text` field.
+        assert_eq!(
+            parse_completion(r#"{"choices":[{"message":{"content":"ok"}}]}"#).unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            parse_completion(r#"{"choices":[{"text":"older shape"}]}"#).unwrap(),
+            "older shape"
+        );
     }
 
     #[test]

@@ -304,6 +304,14 @@ fn cancel_requested() -> bool {
 /// browser: a dropped read must never read as "submitted" (the caller would then
 /// believe in a message that is not there), and a turn that started must never be
 /// dismissed because its speech bubble has not painted yet.
+///
+/// The generation signal has one honest weakness: it cannot tell *whose*
+/// generation it is. A previous turn still streaming would satisfy this and get
+/// the run to the reply-wait loop on a message that was never sent. That is
+/// accepted rather than guarded because `fill_composer` already waits out and
+/// refuses a busy page, and because the consequence is now merely a slower wait:
+/// the poll loop treats identity, not this count, as the evidence about which
+/// page it is on.
 fn submit_accepted(baseline: u64, users_now: Option<u64>, stop_now: bool) -> bool {
     stop_now || users_now.is_some_and(|n| n > baseline)
 }
@@ -332,6 +340,31 @@ fn rebase_from_page(
         if let Some(n) = v.get("assistant_count").and_then(|x| x.as_u64()) {
             *baseline_count = (*baseline_count).min(n);
         }
+    }
+}
+
+/// Wait until the tab really IS a new chat, not merely a tab with a composer.
+///
+/// Every ChatGPT page has a composer, so `wait_composer` answers true the moment
+/// the "New chat" click lands -- while the conversation we are clicking away
+/// from is still in the DOM. A live run lost a finished planning turn that way:
+/// the pre-turn user-turn baseline was read from the stale page (2), the fresh
+/// chat then rendered 1, and `1 <= 2` with no conversation id to compare
+/// against yet is what the poll loop calls "the page was replaced". It gave up
+/// while ChatGPT had already replied.
+fn wait_new_chat(ab: &PathBuf, session: &str, deadline: Instant) -> bool {
+    loop {
+        if let Ok(v) = ab_eval(ab, JS_STATE_CHEAP, session, 15.0) {
+            let users = v.get("user_count").and_then(|x| x.as_u64()).unwrap_or(0);
+            let assistants = v.get("assistant_count").and_then(|x| x.as_u64()).unwrap_or(0);
+            if users == 0 && assistants == 0 {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -1082,9 +1115,16 @@ impl Channel {
                 .unwrap_or(false);
             if reused {
                 let settle = Instant::now() + Duration::from_secs(20);
-                if wait_composer(&ab, &session, settle, 20).unwrap_or(false) {
+                if wait_composer(&ab, &session, settle, 20).unwrap_or(false)
+                    && wait_new_chat(&ab, &session, Instant::now() + Duration::from_secs(8))
+                {
                     eprintln!("reusing the open ChatGPT tab (new chat, no page reload)");
                     opened = true;
+                } else {
+                    // The click did not produce an empty conversation. Opening a
+                    // page costs about 45 backend requests and this path costs 9,
+                    // but the alternative is baselines read off a stale DOM.
+                    eprintln!("the reused tab did not become a fresh chat; opening one");
                 }
             }
         }
@@ -1607,7 +1647,10 @@ impl Channel {
             .ok()
             .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
             .unwrap_or(false);
-        if !(in_place && wait_composer(&self.ab, &self.session, deadline, 20).unwrap_or(false)) {
+        if !(in_place
+            && wait_composer(&self.ab, &self.session, deadline, 20).unwrap_or(false)
+            && wait_new_chat(&self.ab, &self.session, Instant::now() + Duration::from_secs(8)))
+        {
             ab_open(&self.ab, &self.session, WEB_NEW_CHAT_URL, None, deadline)
                 .context("reopening ChatGPT")?;
         }
@@ -2011,6 +2054,10 @@ impl Channel {
         // looks "stuck and hot" is this and not the model.
         const MAX_REATTACHES: u32 = 3;
         let mut reattaches = 0u32;
+        // How many consecutive looks at a page that is not showing our turn one
+        // message before believing it. Six is ~12s: past a slow render, short
+        // enough that a genuinely replaced page is still reported quickly.
+        const TURN_ONE_LOST_LIMIT: u32 = 6;
 
         // How often to ask the server instead of the page. Every 10th ~2s poll.
         const SERVER_CHECK_EVERY: u64 = 10;
@@ -2113,18 +2160,36 @@ impl Channel {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
 
-            // Id-independent loss check, and the only one that works on turn one:
-            // ChatGPT doesn't put /c/<id> in the URL until the FIRST turn is
-            // persisted, so mid-turn-one there is no identity to compare. But we
-            // hold a submit receipt — the user-turn count rose — and that count
-            // can never legitimately go DOWN. If it does, we're looking at a
-            // different (blank) page.
+            // Id-independent loss check, needed for turn one: ChatGPT doesn't put
+            // /c/<id> in the URL until the FIRST turn is persisted, so mid-turn
+            // one there is no identity to compare against, and a count that has
+            // not risen is all we get. Note it is not proof of a blank page --
+            // the count legitimately DROPS whenever the tab is showing a shorter
+            // conversation than the one we baselined, which is exactly what a new
+            // chat is. That is why this only fires when identity cannot confirm
+            // the page (below), why it waits for a sustained pattern rather than
+            // one look, and why the new-chat handover has to verify it actually
+            // landed on an empty conversation (`wait_new_chat`).
             let users_now = read
                 .as_ref()
                 .ok()
                 .and_then(|v| v.get("user_count"))
                 .and_then(|v| v.as_u64());
-            if users_now.is_some_and(|n| n <= baseline_users) {
+            // Identity, once we have it, beats counting. If the page's URL is the
+            // conversation we pinned, then this IS the right page, and a
+            // user-turn count that has not risen yet is a rendering question
+            // rather than a lost tab: ChatGPT virtualizes the message list, so a
+            // reloaded conversation can legitimately show fewer bubbles than the
+            // one we scrolled through, and the count then argues with itself
+            // forever. Live, that argument drove 38 reattaches -- and every
+            // reattach is a navigation, roughly 45 backend requests against an
+            // account that is throttled by request count. The count stays the
+            // loss detector only for turn one, where no id exists to compare.
+            let ours_by_id = matches!(
+                (&self.convo_id, &seen_convo),
+                (Some(pinned), Some(seen)) if pinned == seen
+            );
+            if users_now.is_some_and(|n| n <= baseline_users) && !ours_by_id {
                 if self.convo_id.is_some() {
                     lost_polls += 1;
                     if lost_polls >= LOST_POLLS_BEFORE_REATTACH {
@@ -2150,13 +2215,24 @@ impl Channel {
                     }
                     continue;
                 }
-                bail!(
-                    "the ChatGPT page was replaced while the first turn was still \
-                     running, and ChatGPT does not put a conversation id in the URL \
-                     until that turn finishes — so there is no conversation to \
-                     reattach to. The reply may still have completed in your \
-                     browser; rerun the command."
-                );
+                // Turn one has no id to compare against, so this count is the
+                // only evidence there is -- but one look is not a pattern. A
+                // fresh chat takes seconds to render, and bailing on the first
+                // poll threw away a planning turn ChatGPT had already answered,
+                // inside five seconds of submitting it. Require a sustained read
+                // below the baseline; a genuinely replaced page still fails,
+                // just a few polls later.
+                lost_polls += 1;
+                if lost_polls >= TURN_ONE_LOST_LIMIT {
+                    bail!(
+                        "the ChatGPT page never showed the first turn's message after \
+                         {lost_polls} looks, and there is no conversation id to reattach \
+                         to yet (ChatGPT does not put one in the URL until that turn \
+                         finishes). The reply may still have completed in your browser; \
+                         rerun the command."
+                    );
+                }
+                continue;
             }
 
             match (&self.convo_id, &seen_convo) {

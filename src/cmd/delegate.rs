@@ -159,6 +159,12 @@ pub fn run(args: &DelegateArgs) -> Result<()> {
             }
             Err(e) => {
                 failed += 1;
+                // The reason has to reach stderr. It used to exist only inside
+                // the report string handed to the planner, so a live run printed
+                // `[chunk 1] steps 1-5`, then the planner's reply, then a failed
+                // exit -- and nothing anywhere said what the executor actually
+                // did wrong.
+                eprintln!("[chunk {}] FAILED: {e:#}", chunk.index + 1);
                 // Whatever just failed, this model is not proven for the job,
                 // and the next run must not be steered straight back to it by
                 // the cache.
