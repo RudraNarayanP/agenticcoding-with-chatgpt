@@ -385,6 +385,37 @@ const JS_STATE: &str = r#"(() => {
   });
 })()"#;
 
+// JS: the polling tick, stripped to what the poll loop actually uses while a
+// reply is streaming. Deliberately NOT a subset of JS_STATE: it reads
+// `text_len` (a character count) where JS_STATE reads `atext` (the rendered
+// text), because `innerText` forces a synchronous layout of the node it is
+// called on. See `send_turn` for why the split is free.
+const JS_STATE_CHEAP: &str = r#"(() => {
+  const stop = !!document.querySelector(
+    'button[data-testid="stop-button"], button[aria-label*="Stop" i]'
+  );
+  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
+  const lastA = a[a.length - 1];
+  const cm = location.pathname.match(/\/c\/([0-9a-f-]{36})/i);
+  // A dialog costs nothing until one exists, which is almost never. When one
+  // does, read the same nodes JS_STATE reads so `limited` means the same thing.
+  let limited = false;
+  if (document.querySelector('[role="dialog"]')) {
+    limited = /too many requests|requests too quickly/i.test(
+      [...document.querySelectorAll('[role="dialog"]')]
+        .map(d => d.textContent || '').join(' ')
+    );
+  }
+  return JSON.stringify({
+    stop,
+    convo: cm ? cm[1] : "",
+    user_count: document.querySelectorAll('[data-message-author-role="user"]').length,
+    assistant_count: a.length,
+    limited,
+    text_len: lastA ? (lastA.textContent || '').length : 0
+  });
+})()"#;
+
 // JS: scrape the full innerText of the last assistant message.
 const JS_LAST_ASSISTANT: &str = r#"(() => {
   const a = document.querySelectorAll('[data-message-author-role="assistant"]');
@@ -1232,6 +1263,23 @@ impl Channel {
         // it gives up rather than blocking — a stop button that never clears is
         // its own problem and the submit check below will report it honestly.
         let busy = |ch: &Self| {
+            // `stop` on its own answers "busy", and asking for it alone skips
+            // JS_STATE's layout-forcing `innerText` read and its walk over every
+            // button on the page — this closure runs twice a second for up to ten
+            // seconds, which is exactly the window where the page is busiest. Only
+            // when the page claims to be idle do we need `tool_active`, the one
+            // case the cheap tick cannot see. Same shape as the poll loop below.
+            let cheap = ab_eval(&ch.ab, JS_STATE_CHEAP, &ch.session, budget).ok();
+            if cheap
+                .as_ref()
+                .and_then(|v| v.get("stop").and_then(|b| b.as_bool()))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            if cheap.is_none() {
+                return false;
+            }
             ab_eval(&ch.ab, JS_STATE, &ch.session, budget)
                 .ok()
                 .filter(|v| v.is_object())
@@ -1954,7 +2002,34 @@ impl Channel {
                 return self.stop_generation(remaining_secs());
             }
 
-            let read = ab_eval(&self.ab, JS_STATE, &self.session, remaining_secs());
+            // Two different questions, two very different costs.
+            //
+            // While the stop button is up, the only thing this loop uses from the
+            // page is "is it still going?" — the `stop || tool_active` test below
+            // continues, and it discards both the scraped reply text and the
+            // tool-chip scan. JS_STATE computes those anyway, and they are the two
+            // expensive ones: `lastA.innerText` forces a synchronous layout of the
+            // node it reads, and the node is a markdown message being rewritten
+            // every frame, while `tool_active` walks every button on the page
+            // calling `closest()` on each. So the page paid for work whose result
+            // was thrown away, on every poll, for the whole generation — how much
+            // that cost on a given machine was not measured, but the fix is free:
+            // ask the cheap question while it is still answering, and only pay for
+            // the full read once it has stopped, which is where the settle logic
+            // actually needs the text and the tool marker.
+            let cheap = ab_eval(&self.ab, JS_STATE_CHEAP, &self.session, remaining_secs());
+            let generating = cheap
+                .as_ref()
+                .ok()
+                .and_then(|v| v.get("stop").and_then(|x| x.as_bool()))
+                .unwrap_or(false);
+            // An unreadable page goes straight through to the lost-tab handling
+            // below, exactly as a failed JS_STATE used to; do not double-tap it.
+            let read = if generating || cheap.is_err() {
+                cheap
+            } else {
+                ab_eval(&self.ab, JS_STATE, &self.session, remaining_secs())
+            };
 
             // Is this still OUR conversation? Identity — not "did the eval
             // error?" — is the reliable signal that we lost the page. Closing
@@ -2116,6 +2191,11 @@ impl Channel {
             let elapsed = started.elapsed().as_secs();
             if elapsed >= last_beat + 5 {
                 last_beat = elapsed;
+                // `tool_active` is only computed by the full read, so while the
+                // stop button is up this says "generating" rather than "running a
+                // tool". The stop button is up in both cases, so the line is still
+                // true; the distinction reappears the moment it matters (a settle
+                // phase where the stop button is gone but a tool is still running).
                 let phase = if tool_active {
                     "running a tool"
                 } else if stop {
@@ -2123,10 +2203,14 @@ impl Channel {
                 } else {
                     "waiting for reply"
                 };
-                eprintln!(
-                    "[{elapsed:5}.0s] {phase} (msgs={cur_count}, len={})",
-                    atext.len()
-                );
+                // The cheap tick reports a length rather than the text itself;
+                // `len climbing` still means streaming, `len frozen` still means
+                // settling, which is all this column was ever used for.
+                let len = st
+                    .get("text_len")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(atext.len() as u64);
+                eprintln!("[{elapsed:5}.0s] {phase} (msgs={cur_count}, len={len})");
             }
 
             if !atext.is_empty() {
@@ -3208,6 +3292,50 @@ fn detect_logged_in_profiles() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The poll loop runs every 2s for the whole length of a reply, and does it
+    /// inside the user's own browser. `innerText` is not a string read: it forces
+    /// a synchronous layout of the node, and the node is a markdown message being
+    /// rewritten every frame. `closest()` over every button is the other one. Both
+    /// results are discarded while the stop button is up, so before the split they
+    /// were work done for nothing, every poll, during the page's busiest phase.
+    /// This locks the cheap tick cheap.
+    #[test]
+    fn the_polling_tick_never_forces_a_layout() {
+        assert!(
+            !JS_STATE_CHEAP.contains("innerText"),
+            "the polling tick reads innerText, which reflows the streaming \
+             message on every poll"
+        );
+        assert!(
+            !JS_STATE_CHEAP.contains("closest"),
+            "the polling tick walks ancestors of every button on the page"
+        );
+        assert!(
+            !JS_STATE_CHEAP.contains("querySelectorAll('button"),
+            "the polling tick scans every button on the page"
+        );
+        // The cheap tick must still answer everything the loop uses to tell
+        // "still generating" from "the tab disappeared" — a missing field here
+        // reads as a lost page and reconnects a browser tab every 2s.
+        for field in [
+            "stop",
+            "convo",
+            "user_count",
+            "assistant_count",
+            "limited",
+            "text_len",
+        ] {
+            assert!(
+                JS_STATE_CHEAP.contains(field),
+                "JS_STATE_CHEAP does not report {field}"
+            );
+        }
+        // And the full read must keep the two expensive fields, since settling
+        // genuinely cannot be decided without them.
+        assert!(JS_STATE.contains("atext"));
+        assert!(JS_STATE.contains("tool_active"));
+    }
+
     /// One test, not two: both halves have to move HOME, and cargo runs tests
     /// in parallel — as two tests they raced and the second read the first's
     /// directory.
