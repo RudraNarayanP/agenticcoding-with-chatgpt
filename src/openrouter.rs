@@ -606,11 +606,40 @@ fn parse_completion(raw: &str) -> Result<String> {
             raw.trim().chars().take(200).collect::<String>()
         )
     })?;
+    let finish = choice
+        .get("finish_reason")
+        .and_then(|f| f.as_str())
+        .unwrap_or("")
+        .to_string();
+    let thought = choice
+        .pointer("/message/reasoning")
+        .and_then(|r| r.as_str())
+        .or_else(|| choice.pointer("/message/reasoning_content").and_then(|r| r.as_str()))
+        .map(str::len)
+        .unwrap_or(0);
+    let spent = v
+        .pointer("/usage/completion_tokens")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
     let content = choice
         .pointer("/message/content")
         .and_then(|c| c.as_str())
         .or_else(|| choice.get("text").and_then(|t| t.as_str()));
     match content {
+        // A reply that ran into the token budget is not a message. It parses as
+        // text, which `run_chunk` then reads as "the executor chose to stop
+        // talking instead of calling a tool" -- the shape a live run hit while
+        // writing a long bash command into a tool call: the chunk was reported
+        // unfinished for the wrong reason, and the real cause (truncation) never
+        // appeared. Say which it is.
+        Some(c) if finish == "length" => bail!(
+            "the model's reply was cut off at the token budget ({} characters, {} completion \
+             tokens, finish_reason=length), so it is not a complete message. Shrink what one \
+             turn has to produce -- a smaller --chunk-steps, or --exec-model with a larger \
+             context.",
+            c.len(),
+            spent
+        ),
         Some(c) => Ok(c.to_string()),
         // A model that thinks instead of typing comes back with `content: null`
         // and nothing to show for it. Say which of the two failure shapes it is,
@@ -618,27 +647,13 @@ fn parse_completion(raw: &str) -> Result<String> {
         // eaten by hidden reasoning, any other finish reason means the model
         // answered nothing at all.
         None => {
-            let finish = choice
-                .get("finish_reason")
-                .and_then(|f| f.as_str())
-                .unwrap_or("unknown");
-            let thought = choice
-                .pointer("/message/reasoning")
-                .and_then(|r| r.as_str())
-                .or_else(|| choice.pointer("/message/reasoning_content").and_then(|r| r.as_str()))
-                .map(str::len)
-                .unwrap_or(0);
-            let spent = v
-                .pointer("/usage/completion_tokens")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0);
             bail!(
                 "the model returned no content (finish_reason={finish}, {thought} characters of \
                  hidden reasoning, {spent} completion tokens). {}",
                 if finish == "length" {
-                    "It spent the whole token budget thinking rather than answering -- raise \
-                     --exec-timeout only helps if the provider is also slow; the fix is a model \
-                     that answers, or --exec-model naming one."
+                    "It spent the whole token budget thinking rather than answering -- the \
+                     request already asks for thinking to be off, so this is a model that \
+                     ignores that switch; name another with --exec-model."
                 } else {
                     "Nothing was produced at all; this is a provider that accepted the request \
                      and returned an empty message."
@@ -1194,6 +1209,14 @@ mod tests {
         let silent = r#"{"choices":[{"message":{"role":"assistant"},"finish_reason":"stop"}]}"#;
         let msg = parse_completion(silent).unwrap_err().to_string();
         assert!(msg.contains("Nothing was produced at all"), "{msg}");
+
+        // The shape a live run actually hit: a long tool call, cut off mid-write
+        // by the token budget. This must not be returned as a usable reply.
+        let truncated = r#"{"choices":[{"message":{"role":"assistant","content":"{\"tool_calls\":[{\"name\":\"bash\",\"input\":{\"command\":\"python3 -c \\\"import webbr"},
+            "finish_reason":"length"}],"usage":{"completion_tokens":8192}}"#;
+        let msg = parse_completion(truncated).unwrap_err().to_string();
+        assert!(msg.contains("cut off at the token budget"), "{msg}");
+        assert!(msg.contains("8192 completion tokens"), "{msg}");
 
         // The shapes that do work still parse, including the older `text` field.
         assert_eq!(
