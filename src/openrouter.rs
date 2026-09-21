@@ -384,8 +384,28 @@ pub fn api_key() -> Result<String> {
 fn is_transient(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     [
-        "overload", "temporarily", "try again", "rate limit", "ratelimit", "429", "500", "502",
-        "503", "504", "upstream", "timeout", "timed out", "reset", "unavailable", "busy",
+        // The exact wording OpenRouter uses when the upstream behind a free
+        // model is down or throttling: "Provider returned error". It was missing
+        // from this list, so the one flap that a live run of the executor test
+        // hit came back as a permanent refusal with no retry at all -- and a
+        // free tier flaps more often than it does anything else.
+        "provider returned error",
+        "overload",
+        "temporarily",
+        "try again",
+        "rate limit",
+        "ratelimit",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "upstream",
+        "timeout",
+        "timed out",
+        "reset",
+        "unavailable",
+        "busy",
     ]
     .iter()
     .any(|needle| m.contains(needle))
@@ -1184,6 +1204,26 @@ mod tests {
             parse_completion(r#"{"choices":[{"text":"older shape"}]}"#).unwrap(),
             "older shape"
         );
+    }
+
+    /// A live run of the executor test hit `Provider returned error` on a model
+    /// that answers fine seconds later. The phrase matched no transient needle,
+    /// so it was treated as permanent and the chunk died without a single retry.
+    /// A request that is actually wrong must not be retried -- that just hammers
+    /// the endpoint for a model that will never accept it.
+    #[test]
+    fn a_flapping_provider_retries_and_a_bad_request_does_not() {
+        assert!(is_transient(
+            "OpenRouter refused the request: Provider returned error (model cohere/north-mini-code:free)"
+        ));
+        assert!(is_transient(
+            "poolside/laguna-s-2.1:free is temporarily rate-limited upstream. Please retry shortly"
+        ));
+        assert!(is_transient("Nemotron: Service temporarily overloaded"));
+        assert!(is_transient("HTTP 503 Service Unavailable"));
+
+        assert!(!is_transient("OpenRouter refused the request: No auth credentials provided"));
+        assert!(!is_transient("openai/gpt-4o is not a free-tier model"));
     }
 
     #[test]
